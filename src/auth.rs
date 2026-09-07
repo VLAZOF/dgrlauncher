@@ -1,7 +1,7 @@
-use iced::{stream, Subscription};
 use iced::futures::SinkExt;
+use iced::{Subscription, stream};
 use reqwest::{Client, StatusCode, Url};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::hash::Hash;
 const AZURE_CLIENT_ID: &str = "7f8e9d75-ca8f-4603-b2ab-ae7fc0f871d9";
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -28,13 +28,12 @@ pub struct XboxLiveData {
 }
 pub async fn request_code() -> AuthCode {
     let client = Client::new();
-    let mut url = Url::parse("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode").unwrap();
-    url.query_pairs_mut().append_pair("client_id", AZURE_CLIENT_ID).append_pair("scope", "XboxLive.signin offline_access");
-    let response = match client
-        .get(url)
-        .send()
-        .await
-    {
+    let mut url =
+        Url::parse("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode").unwrap();
+    url.query_pairs_mut()
+        .append_pair("client_id", AZURE_CLIENT_ID)
+        .append_pair("scope", "XboxLive.signin offline_access");
+    let response = match client.get(url).send().await {
         Ok(ok) => ok.text().await.unwrap(),
         Err(e) => panic!("{e}"),
     };
@@ -70,7 +69,13 @@ pub fn start_wait_for_login<I: 'static + Hash + Copy + Send + Sync>(
                 let response = match client
                     .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
                     .header("Content-Type", "application/x-www-form-urlencoded")
-                    .body(format!("client_id={}&scope={}&grant_type={}&device_code={}", AZURE_CLIENT_ID, "XboxLive.signin offline_access", "urn:ietf:params:oauth:grant-type:device_code", device_code))
+                    .body(format!(
+                        "client_id={}&scope={}&grant_type={}&device_code={}",
+                        AZURE_CLIENT_ID,
+                        "XboxLive.signin offline_access",
+                        "urn:ietf:params:oauth:grant-type:device_code",
+                        device_code
+                    ))
                     .send()
                     .await
                 {
@@ -206,7 +211,10 @@ pub async fn login_with_refresh_token(refresh_token: String) -> Option<Minecraft
     let response = match client
         .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(format!("client_id={}&scope={}&grant_type={}&refresh_token={}", AZURE_CLIENT_ID, "XboxLive.signin offline_access", "refresh_token", refresh_token))
+        .body(format!(
+            "client_id={}&scope={}&grant_type={}&refresh_token={}",
+            AZURE_CLIENT_ID, "XboxLive.signin offline_access", "refresh_token", refresh_token
+        ))
         .send()
         .await
     {
