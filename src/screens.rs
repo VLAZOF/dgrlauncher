@@ -2,7 +2,7 @@ use iced::{
     alignment,
     widget::{
         button, column, container, pick_list, row, scrollable, slider, svg, text, text_input,
-        toggler, Column,
+        toggler, tooltip, Column,
     },
     Alignment, Length,
 };
@@ -15,7 +15,7 @@ pub fn get_screen_content<'a>(
             let (launch_text, launch_message) = match app.launcher.state {
                 LauncherState::Idle => ("Launch", Option::Some(Message::Launch)),
                 LauncherState::Launching(_) => ("Launching", Option::None),
-                LauncherState::GettingLogs => ("Running", Option::None),
+                LauncherState::GettingLogs(_) => ("Running", Option::None),
                 LauncherState::Waiting => ("...", Option::None),
             };
             let launch_button = button(
@@ -28,7 +28,7 @@ pub fn get_screen_content<'a>(
             .height(60)
             .on_press_maybe(launch_message);
             let close_button = match app.launcher.state {
-                LauncherState::GettingLogs => Some(
+                LauncherState::GettingLogs(_) => Some(
                     button(
                         text("Close game")
                             .size(15)
@@ -157,21 +157,14 @@ pub fn get_screen_content<'a>(
                         .spacing(10)
                         .max_width(800),
                         column![
-                            text("Game instance:"),
-                            pick_list(
-                                app.game_instance_list.clone(),
-                                Some(app.current_game_instance.clone()),
-                                Message::GameInstanceChanged
-                            )
-                            .width(250)
-                            .text_size(25),
-                            button(
-                                text("Manage game instances")
-                                    .width(250)
-                                    .align_x(alignment::Horizontal::Center)
-                            )
-                            .height(32)
-                            .on_press(Message::ChangeScreen(Screen::GameInstance))
+                            text("Game data folder:"),
+                            text(if app.current_version.is_empty() {
+                                String::from("Select a version first")
+                            } else {
+                                super::game_instance_dir_for_version(&app.current_version)
+                            })
+                            .size(13),
+                            text("Each version keeps its own saves, mods and configs.").size(12)
                         ]
                         .spacing(10)
                         .max_width(800)
@@ -320,34 +313,6 @@ pub fn get_screen_content<'a>(
         ]
         .spacing(15)
         .max_width(800),
-        Screen::GameInstance => column![
-            text("Manage game instances")
-                .size(50)
-                .align_x(alignment::Horizontal::Center),
-            container(
-                column![
-                    text("New game instance"),
-                    text("Game instance name:"),
-                    text_input("", &app.game_instance_to_add)
-                        .on_input(Message::GameInstanceToAddChanged)
-                        .size(25)
-                        .width(250),
-                    button(
-                        text("Add")
-                            .size(15)
-                            .align_x(alignment::Horizontal::Center)
-                    )
-                    .width(135)
-                    .height(35)
-                    .on_press(Message::GameInstanceAdded)
-                ]
-                .spacing(15)
-            )
-            .style(theme::black_container)
-            .padding(15)
-        ]
-        .spacing(15)
-        .max_width(800),
         Screen::Logs => column![
             text("Game logs").size(25),
             container(
@@ -397,7 +362,24 @@ pub fn get_screen_content<'a>(
                 row![
                     container(
                         column![
-                            text("Updates").size(15),
+                            row![
+                                text("Updates").size(15),
+                                tooltip(
+                                    button(svg(svg::Handle::from_memory(
+                                        include_bytes!("icons/refresh.svg").as_slice(),
+                                    )))
+                                    .on_press(Message::RecheckUpdates)
+                                    .style(theme::transparent_button)
+                                    .width(28)
+                                    .height(28)
+                                    .padding(2),
+                                    "Check for updates",
+                                    tooltip::Position::Top,
+                                )
+                                .style(theme::black_container)
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
                             text(update_text),
                             button("Update")
                                 .on_press_maybe(update_button_message)

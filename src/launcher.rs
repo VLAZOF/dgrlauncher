@@ -372,19 +372,13 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
         }
         State::Launching(game_settings) => {
             let minecraft_directory = get_minecraft_dir();
-            let game_dir = if game_settings.game_directory == *"Default" {
-                env::set_current_dir(&minecraft_directory)
-                    .expect("Failed to open instance folder!");
-                minecraft_directory.clone()
-            } else {
-                let gamedirpath = format!(
-                    "{}/dgrlauncher_instances/{}",
-                    minecraft_directory, game_settings.game_directory
-                );
-                fs::create_dir_all(&gamedirpath).unwrap();
-                env::set_current_dir(&gamedirpath).expect("Failed to open instance folder!");
-                gamedirpath
-            };
+            // game_directory is always the full isolated path
+            // ({minecraft_dir}/dgrlauncher_instances/<version>),
+            // computed by the caller. Shared files (versions, libraries,
+            // assets, java) stay in `.minecraft`.
+            let game_dir = game_settings.game_directory.clone();
+            fs::create_dir_all(&game_dir).expect("Failed to create instance folder!");
+            env::set_current_dir(&game_dir).expect("Failed to open instance folder!");
             let assets_dir = format!("{}/assets", &minecraft_directory);
             let jsonpathstring = format!(
                 "{}/versions/{}/{}.json",
@@ -569,8 +563,10 @@ async fn run_and_log_game(
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 match line {
+                    // The receiver is gone when the UI subscription is
+                    // replaced (e.g. on exit): keep draining without panic.
                     Ok(line) => {
-                        sender.send(line).expect("Failed to send log line");
+                        let _ = sender.send(line);
                     }
                     Err(err) => eprintln!("Error reading child output: {}", err),
                 }
@@ -581,7 +577,7 @@ async fn run_and_log_game(
             for line in reader.lines() {
                 match line {
                     Ok(line) => {
-                        sender.send(line).expect("Failed to send log line");
+                        let _ = sender.send(line);
                     }
                     Err(err) => eprintln!("Error reading child output: {}", err),
                 }

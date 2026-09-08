@@ -78,13 +78,11 @@ struct DgrLauncher {
     game_ram: f64,
     current_java_name: String,
     current_java: Java,
-    current_game_instance: String,
     game_wrapper_commands: String,
     game_enviroment_variables: String,
     show_all_versions_in_download_list: bool,
     all_versions: Vec<String>,
     java_name_list: Vec<String>,
-    game_instance_list: Vec<String>,
     vanilla_versions_download_list: Vec<String>,
     fabric_versions_download_list: Vec<String>,
     vanilla_version_to_download: String,
@@ -95,7 +93,6 @@ struct DgrLauncher {
     jvm_to_add_name: String,
     jvm_to_add_path: String,
     jvm_to_add_flags: String,
-    game_instance_to_add: String,
     restrict_launch: bool,
     java_download_size: u8,
     game_proccess: GameProcess,
@@ -130,7 +127,6 @@ pub enum Screen {
     Settings,
     Installation,
     Java,
-    GameInstance,
     Logs,
     ModifyCommand,
     InfoAndUpdates,
@@ -149,7 +145,6 @@ enum Message {
     CurrentAccountChanged(String),
     VersionChanged(String),
     JavaChanged(String),
-    GameInstanceChanged(String),
     GameRamChanged(f64),
     GameWrapperCommandsChanged(String),
     GameEnviromentVariablesChanged(String),
@@ -167,9 +162,8 @@ enum Message {
     JvmPathToAddChanged(String),
     JvmFlagsToAddChanged(String),
     JvmAdded,
-    GameInstanceToAddChanged(String),
-    GameInstanceAdded,
     CheckedUpdates(Result<(String, String), String>),
+    RecheckUpdates,
     Update,
     OpenURL(String),
     CopyToClipboard(String),
@@ -231,7 +225,7 @@ impl DgrLauncher {
                 .collect(),
             ram: self.game_ram,
             game_wrapper_commands: wrapper_commands_vec,
-            game_directory: self.current_game_instance.clone(),
+            game_directory: game_instance_dir_for_version(&self.current_version),
             java_type,
             enviroment_variables: enviroment_variables_hash_map,
         };
@@ -289,18 +283,6 @@ fn boot() -> (DgrLauncher, Task<Message>) {
                 Err(d) => println!("Failed to create launcher_profiles.json: {}.", d),
             }
         }
-        let entries = fs::read_dir(game_instance_folder_path).unwrap();
-        let mut new_game_instance_list = entries
-            .filter_map(|entry| {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    Some(path.file_name().unwrap().to_string_lossy().to_string())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        new_game_instance_list.push("Default".to_string());
         let mut accounts = vec![];
         if let Some(accounts_vec) = p["accounts"].as_array() {
             for account in accounts_vec {
@@ -314,7 +296,7 @@ fn boot() -> (DgrLauncher, Task<Message>) {
                 })
             }
         }
-        let current_account = Account {
+        let mut current_account = Account {
             microsoft: p["current_account"]["microsoft"].as_bool().unwrap(),
             username: p["current_account"]["username"]
                 .as_str()
@@ -325,6 +307,14 @@ fn boot() -> (DgrLauncher, Task<Message>) {
                 .unwrap()
                 .to_owned(),
         };
+        // Self-heal: current_account must exist in accounts list.
+        // Fixes configs broken by the old RemoveAccount handler.
+        if !current_account.username.is_empty()
+            && !accounts.iter().any(|a| a.username == current_account.username)
+        {
+            current_account = accounts.first().cloned().unwrap_or_default();
+            persist_current_account(&current_account);
+        }
         let initial_screen = match is_first_launcher_use{
             true => Screen::GettingStarted,
             false => Screen::Main,
@@ -337,7 +327,6 @@ fn boot() -> (DgrLauncher, Task<Message>) {
                 game_ram: p["game_ram"].as_f64().unwrap(),
                 current_java_name: currentjava.name.clone(),
                 current_java: currentjava,
-                current_game_instance: p["current_game_instance"].as_str().unwrap().to_owned(),
                 game_wrapper_commands: p["game_wrapper_commands"].as_str().unwrap().to_owned(),
                 game_enviroment_variables: p["game_enviroment_variables"]
                     .as_str()
@@ -345,7 +334,6 @@ fn boot() -> (DgrLauncher, Task<Message>) {
                     .to_owned(),
                 show_all_versions_in_download_list: p["show_all_versions"].as_bool().unwrap(),
                 java_name_list: jvmnames,
-                game_instance_list: new_game_instance_list,
                 needs_to_update_download_list: true,
                 accounts,
                 is_first_launcher_use,
@@ -461,7 +449,14 @@ impl DgrLauncher {
                         }
                     }
                     launcher::Progress::Started(child) => {
-                        state.launcher.state = LauncherState::GettingLogs;
+                        // Move the settings along so the subscription keeps
+                        // the same recipe and the log stream survives.
+                        let settings = match &state.launcher.state {
+                            LauncherState::Launching(s) => s.clone(),
+                            LauncherState::GettingLogs(s) => s.clone(),
+                            _ => return Task::none(),
+                        };
+                        state.launcher.state = LauncherState::GettingLogs(settings);
                         state.game_proccess = GameProcess::Running(child);
                         state.game_state_text = String::new()
                     }
@@ -471,6 +466,7 @@ impl DgrLauncher {
                     launcher::Progress::Finished => {
                         state.game_state_text = String::new();
                         state.launcher.state = LauncherState::Idle;
+                        state.game_proccess = GameProcess::Null;
                     }
                     launcher::Progress::Errored(e) => {
                         state.game_state_text = e;
@@ -488,7 +484,6 @@ impl DgrLauncher {
                     updatesettingsfile(
                         state.game_ram,
                         state.current_java_name.clone(),
-                        state.current_game_instance.clone(),
                         state.game_wrapper_commands.clone(),
                         state.game_enviroment_variables.clone(),
                         state.show_all_versions_in_download_list,
@@ -533,15 +528,18 @@ impl DgrLauncher {
                 Task::none()
             }
             Message::OpenGameInstanceFolder => {
-                if state.current_game_instance == "Default" {
-                    open::that(launcher::get_minecraft_dir()).unwrap();
+                // Each version runs in its own isolated folder:
+                // dgrlauncher_instances/<version>.
+                let dir = if state.current_version.is_empty() {
+                    format!("{}/dgrlauncher_instances", launcher::get_minecraft_dir())
                 } else {
-                    open::that(format!(
-                        "{}/dgrlauncher_instances/{}",
-                        launcher::get_minecraft_dir(),
-                        state.current_game_instance
-                    ))
-                    .unwrap();
+                    game_instance_dir_for_version(&state.current_version)
+                };
+                if let Err(e) = fs::create_dir_all(&dir) {
+                    println!("Failed to create game instance folder: {e}");
+                }
+                if let Err(e) = open::that(&dir) {
+                    println!("Failed to open game instance folder: {e}");
                 }
                 Task::none()
             }
@@ -582,10 +580,6 @@ impl DgrLauncher {
                     path: newjvm[1].clone(),
                     flags: newjvm[2].clone(),
                 };
-                Task::none()
-            }
-            Message::GameInstanceChanged(new_game_instance) => {
-                state.current_game_instance = new_game_instance;
                 Task::none()
             }
             Message::GameRamChanged(new_ram) => {
@@ -683,39 +677,6 @@ impl DgrLauncher {
                         .open(get_config_file_path())
                         .unwrap();
                     file.write_all(serialized.as_bytes()).unwrap();
-                    state.screen = Screen::Settings;
-                }
-                Task::none()
-            }
-            Message::GameInstanceToAddChanged(game_prof) => {
-                state.game_instance_to_add = game_prof;
-                Task::none()
-            }
-            Message::GameInstanceAdded => {
-                if !state.game_instance_to_add.is_empty() {
-                    fs::create_dir_all(format!(
-                        "{}/dgrlauncher_instances/{}",
-                        launcher::get_minecraft_dir(),
-                        state.game_instance_to_add
-                    ))
-                    .expect("Failed to create directory!");
-                    let entries = fs::read_dir(format!(
-                        "{}/dgrlauncher_instances",
-                        launcher::get_minecraft_dir()
-                    ))
-                    .unwrap();
-                    let mut new_game_instance_list = entries
-                        .filter_map(|entry| {
-                            let path = entry.unwrap().path();
-                            if path.is_dir() {
-                                Some(path.file_name().unwrap().to_string_lossy().to_string())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    new_game_instance_list.push("Default".to_string());
-                    state.game_instance_list = new_game_instance_list;
                     state.screen = Screen::Settings;
                 }
                 Task::none()
@@ -909,6 +870,15 @@ impl DgrLauncher {
                 }
                 Task::none()
             }
+            Message::RecheckUpdates => {
+                state.update_available = false;
+                state.update_text = String::new();
+                state.last_version = String::from("Checking for updates...");
+                return Task::perform(
+                    update_manager::check_launcher_updates(),
+                    Message::CheckedUpdates,
+                );
+            }
             Message::Update => {
                 state.downloaders.push(Downloader {
                     state: DownloaderState::Idle,
@@ -959,6 +929,7 @@ impl DgrLauncher {
                 };
                 state.accounts = save_account(account.clone());
                 state.current_account = account;
+                persist_current_account(&state.current_account);
                 state.auth_status = String::from("Account added successfully!");
                 if state.screen == Screen::MicrosoftAccount{
                     if state.is_first_launcher_use{
@@ -978,6 +949,8 @@ impl DgrLauncher {
                 for i in &state.accounts {
                     if i.username == account_name {
                         state.current_account = i.clone();
+                        persist_current_account(&state.current_account);
+                        break;
                     }
                 }
                 Task::none()
@@ -1014,6 +987,7 @@ impl DgrLauncher {
                     };
                     state.accounts = save_account(account.clone());
                     state.current_account = account;
+                    persist_current_account(&state.current_account);
                     if state.is_first_launcher_use{
                         if state.all_versions.is_empty(){
                             state.screen = Screen::GettingStarted2;
@@ -1046,7 +1020,16 @@ impl DgrLauncher {
                         }
                     }
                 }
+                // If the deleted account was the current one, fall back to
+                // the first remaining account (or empty if none left).
+                if state.current_account.username == account_name {
+                    state.current_account = updated_account_list
+                        .first()
+                        .cloned()
+                        .unwrap_or_default();
+                }
                 config_file["accounts"] = serde_json::json!(updated_account_list);
+                config_file["current_account"] = serde_json::json!(state.current_account);
                 let serialized = serde_json::to_string_pretty(&config_file).unwrap();
                 let mut file = OpenOptions::new()
                     .write(true)
@@ -1221,12 +1204,6 @@ fn checksettingsfile() -> bool {
                 serde_json::to_value(String::new()).unwrap(),
             );
         }
-        if !map.contains_key("current_game_instance") {
-            map.insert(
-                "current_game_instance".to_owned(),
-                serde_json::to_value(String::from("Default")).unwrap(),
-            );
-        }
         if !map.contains_key("show_all_versions") {
             map.insert(
                 "show_all_versions".to_owned(),
@@ -1253,6 +1230,44 @@ fn updateusersettingsfile(current_account: Account, version: String) -> std::io:
         .open(get_config_file_path())?;
     file.write_all(serialized.as_bytes())?;
     Ok(())
+}
+fn persist_current_account(current_account: &Account) {
+    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
+    let mut file = match File::open(get_config_file_path()) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("Failed to persist current account: {e}");
+            return;
+        }
+    };
+    let mut contents = String::new();
+    if file.read_to_string(&mut contents).is_err() {
+        println!("Failed to persist current account: cannot read config");
+        return;
+    }
+    let mut data: Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("Failed to persist current account: {e}");
+            return;
+        }
+    };
+    data["current_account"] = serde_json::json!(current_account);
+    let serialized = serde_json::to_string_pretty(&data).unwrap();
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(get_config_file_path())
+    {
+        Ok(f) => f,
+        Err(e) => {
+            println!("Failed to persist current account: {e}");
+            return;
+        }
+    };
+    if let Err(e) = file.write_all(serialized.as_bytes()) {
+        println!("Failed to persist current account: {e}");
+    }
 }
 fn save_account(account: Account) -> Vec<Account> {
     set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
@@ -1289,7 +1304,6 @@ fn save_account(account: Account) -> Vec<Account> {
 fn updatesettingsfile(
     ram: f64,
     currentjvm: String,
-    current_game_instance: String,
     wrapper_commands: String,
     env_variables: String,
     showallversions: bool,
@@ -1301,7 +1315,6 @@ fn updatesettingsfile(
     let mut data: Value = serde_json::from_str(&contents)?;
     data["game_ram"] = serde_json::Value::Number(Number::from_f64(ram).unwrap());
     data["current_java_name"] = serde_json::Value::String(currentjvm);
-    data["current_game_instance"] = serde_json::Value::String(current_game_instance);
     data["game_wrapper_commands"] = serde_json::Value::String(wrapper_commands);
     data["show_all_versions"] = serde_json::Value::Bool(showallversions);
     data["game_enviroment_variables"] = serde_json::Value::String(env_variables);
@@ -1322,7 +1335,10 @@ enum LauncherState {
     Idle,
     Waiting,
     Launching(Box<launcher::GameSettings>),
-    GettingLogs,
+    // Carries the same settings so the launcher subscription recipe
+    // (0, Some(settings)) stays identical and iced keeps the running stream
+    // (which owns the log receiver) alive instead of restarting it.
+    GettingLogs(Box<launcher::GameSettings>),
 }
 impl Default for Launcher {
     fn default() -> Self {
@@ -1341,7 +1357,9 @@ impl Launcher {
             LauncherState::Launching(game_settings) => {
                 launcher::start(0, Some(game_settings)).map(Message::ManageGameInfo)
             }
-            LauncherState::GettingLogs => launcher::start(0, None).map(Message::ManageGameInfo),
+            LauncherState::GettingLogs(game_settings) => {
+                launcher::start(0, Some(game_settings)).map(Message::ManageGameInfo)
+            }
             LauncherState::Waiting => Subscription::none(),
         }
     }
@@ -1433,6 +1451,37 @@ fn get_config_file_path() -> String {
         "{}/dgrlauncher_settings.json",
         launcher::get_minecraft_dir()
     );
+}
+/// Folder name for the isolated game data of a version.
+/// Version names from Mojang are filesystem-safe, but guard against
+/// path separators just in case.
+fn sanitize_instance_name(version: &str) -> String {
+    let sanitized: String = version
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        String::from("unknown")
+    } else {
+        trimmed.to_owned()
+    }
+}
+/// Isolated game directory for a version:
+/// `{minecraft_dir}/dgrlauncher_instances/<version>`.
+/// Shared files (versions, libraries, assets, java) stay in `.minecraft`.
+fn game_instance_dir_for_version(version: &str) -> String {
+    format!(
+        "{}/dgrlauncher_instances/{}",
+        launcher::get_minecraft_dir(),
+        sanitize_instance_name(version)
+    )
 }
 fn is_file_empty(file_path: &str) -> bool {
     let mut file = File::open(file_path).unwrap();
