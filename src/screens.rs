@@ -138,7 +138,7 @@ pub fn get_screen_content<'a>(
                 container(
                     column![
                         column![
-                            text("JVM:"),
+                            text("Java:"),
                             pick_list(
                                 app.java_name_list.clone(),
                                 Some(app.current_java_name.clone()),
@@ -147,12 +147,12 @@ pub fn get_screen_content<'a>(
                             .width(250)
                             .text_size(25),
                             button(
-                                text("Manage JVMs")
+                                text("Custom Java")
                                     .width(250)
                                     .align_x(alignment::Horizontal::Center)
                             )
                             .height(32)
-                            .on_press(Message::ChangeScreen(Screen::Java))
+                            .on_press(Message::ChangeScreen(Screen::CustomJava))
                         ]
                         .spacing(10)
                         .max_width(800),
@@ -275,44 +275,57 @@ pub fn get_screen_content<'a>(
             .spacing(15)
             .max_width(800)
         }
-        Screen::Java => column![
-            text("Manage JVMs")
-                .size(50)
-                .align_x(alignment::Horizontal::Center),
-            container(
-                column![
-                    text("New JVM"),
-                    text("JVM name:"),
-                    text_input("", &app.jvm_to_add_name)
-                        .on_input(Message::JvmNameToAddChanged)
-                        .size(25)
-                        .width(250),
-                    text("JVM path:"),
-                    text_input("", &app.jvm_to_add_path)
-                        .on_input(Message::JvmPathToAddChanged)
-                        .size(25)
-                        .width(250),
-                    text("JVM flags:"),
-                    text_input("", &app.jvm_to_add_flags)
-                        .on_input(Message::JvmFlagsToAddChanged)
-                        .size(25)
-                        .width(250),
-                    button(
-                        text("Add")
+        Screen::CustomJava => {
+            let mut found_column = column![].spacing(5);
+            for java in &app.detected_javas {
+                found_column = found_column.push(
+                    row![
+                        text(format!("Java {} ({})", java.major, java.version)).size(13),
+                        button(text("Use").size(12))
+                            .on_press(Message::DetectedJavaSelected(java.path.clone()))
+                            .padding(5),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                );
+            }
+            column![
+                text("Custom Java").size(50),
+                container(
+                    column![
+                        text("Installed Java"),
+                        button(text("Scan for installed Java").size(14))
+                            .on_press(Message::ScanSystemJavas)
+                            .padding(5),
+                        text(&app.java_scan_status).size(12),
+                        found_column,
+                        text("Java path:"),
+                        text_input("Path to java binary", &app.custom_java_path)
+                            .on_input(Message::CustomJavaPathChanged)
                             .size(15)
-                            .align_x(alignment::Horizontal::Center)
-                    )
-                    .width(135)
-                    .height(35)
-                    .on_press(Message::JvmAdded)
-                ]
-                .spacing(5)
-            )
-            .style(theme::black_container)
-            .padding(15)
-        ]
-        .spacing(15)
-        .max_width(800),
+                            .width(400),
+                        text("Java flags (optional):"),
+                        text_input("Example: -XX:+UseG1GC", &app.custom_java_flags)
+                            .on_input(Message::CustomJavaFlagsChanged)
+                            .size(15)
+                            .width(400),
+                        button(
+                            text("Save and use")
+                                .size(15)
+                                .align_x(alignment::Horizontal::Center)
+                        )
+                        .width(135)
+                        .height(35)
+                        .on_press(Message::SaveCustomJava)
+                    ]
+                    .spacing(10)
+                )
+                .style(theme::black_container)
+                .padding(15)
+            ]
+            .spacing(15)
+            .max_width(800)
+        }
         Screen::Logs => column![
             text("Game logs").size(25),
             container(

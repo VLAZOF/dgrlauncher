@@ -33,9 +33,8 @@ pub enum Progress {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Missing {
-    Java8,
-    Java17,
-    Java21,
+    /// Temurin JRE of this major version must be downloaded.
+    Java(u64),
     VersionFiles(Vec<super::downloader::Download>),
     VanillaJson(String, String),
 }
@@ -43,10 +42,42 @@ pub enum Missing {
 pub enum JavaType {
     System,
     Custom,
-    LauncherJava8,
-    LauncherJava17,
-    LauncherJava21,
     Automatic,
+}
+/// Folder name for a launcher-managed Temurin JRE, e.g. `java25`.
+pub fn managed_java_folder(major: u64) -> String {
+    format!("java{major}")
+}
+/// Required Java major for a version. Mirrors the official launcher:
+/// `javaVersion.majorVersion` from the version json (following `inheritsFrom`
+/// for modded versions). Old versions without the field fall back to a table.
+pub fn required_java_major(version_json: &Value, game_version: &str) -> u64 {
+    if let Some(major) = version_json["javaVersion"]["majorVersion"].as_u64() {
+        return major;
+    }
+    if let Some(major) = version_json["javaVersion"]["Version"].as_u64() {
+        return major;
+    }
+    fallback_java_major(game_version)
+}
+fn fallback_java_major(game_version: &str) -> u64 {
+    // Strip loader suffixes like "1.21.1-fabric".
+    let base = game_version.split('-').next().unwrap_or(game_version);
+    let mut parts = base.split('.');
+    let major: u64 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(1);
+    let minor: u64 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let patch: u64 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    if major != 1 {
+        // New version scheme, unknown requirement: latest known LTS.
+        return 25;
+    }
+    match minor {
+        0..=16 => 8,
+        17 => 17,
+        18..=19 => 17,
+        20 if patch < 5 => 17,
+        _ => 21,
+    }
 }
 pub fn start<I: 'static + Hash + Copy + Send + Sync>(
     id: I,
@@ -325,42 +356,15 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                 );
             }
             match game_settings.java_type {
-                JavaType::LauncherJava8 => {
-                    if !Path::new(&format!("{}/dgrlauncher_java/java8", minecraft_dir)).exists() {
-                        return ((id, Progress::Checked(Some(Missing::Java8))), State::Idle);
-                    }
-                }
-                JavaType::LauncherJava17 => {
-                    if !Path::new(&format!("{}/dgrlauncher_java/java17", minecraft_dir)).exists() {
-                        return ((id, Progress::Checked(Some(Missing::Java17))), State::Idle);
-                    }
-                }
-                JavaType::LauncherJava21 => {
-                    if !Path::new(&format!("{}/dgrlauncher_java/java21", minecraft_dir)).exists() {
-                        return ((id, Progress::Checked(Some(Missing::Java21))), State::Idle);
-                    }
-                }
                 JavaType::Automatic => {
-                    let java_version = if let Some(java) = p["javaVersion"]["majorVersion"].as_i64()
-                    {
-                        java
-                    } else if let Some(java) = p["javaVersion"]["Version"].as_i64() {
-                        java
-                    } else {
-                        17
-                    };
-                    if java_version > 17
-                        && !Path::new(&format!("{}/dgrlauncher_java/java21", minecraft_dir)).exists()
-                    {
-                        return ((id, Progress::Checked(Some(Missing::Java21))), State::Idle);
-                    } else if java_version > 8
-                        && !Path::new(&format!("{}/dgrlauncher_java/java17", minecraft_dir)).exists()
-                    {
-                        return ((id, Progress::Checked(Some(Missing::Java17))), State::Idle);
-                    } else if java_version == 8
-                        && !Path::new(&format!("{}/dgrlauncher_java/java8", minecraft_dir)).exists()
-                    {
-                        return ((id, Progress::Checked(Some(Missing::Java8))), State::Idle);
+                    let required = modded_aware_required_major(&p, &minecraft_dir, &game_settings.game_version);
+                    let folder = format!(
+                        "{}/dgrlauncher_java/{}",
+                        minecraft_dir,
+                        managed_java_folder(required)
+                    );
+                    if !Path::new(&folder).exists() {
+                        return ((id, Progress::Checked(Some(Missing::Java(required)))), State::Idle);
                     }
                 }
                 _ => {}
@@ -437,30 +441,6 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
             let (java_path, java_args) = match game_settings.java_type{
                 JavaType::System => ("java".to_owned(), get_vec_from("-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseNUMA -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=400M -XX:NonNMethodCodeHeapSize=12M -XX:ProfiledCodeHeapSize=194M -XX:NonProfiledCodeHeapSize=194M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -XX:+UseVectorCmov -XX:+PerfDisableSharedMem -XX:+UseFastUnorderedTimeStamps -XX:+UseCriticalJavaThreadPriority -XX:ThreadPriorityPolicy=1 -XX:AllocatePrefetchStyle=3")),
                 JavaType::Custom => (game_settings.jvm, game_settings.jvmargs),
-                JavaType::LauncherJava8 => {
-                    let args = get_vec_from("-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+ParallelRefProcEnabled -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:+AggressiveOpts -XX:MaxInlineLevel=15 -XX:MaxVectorSize=32 -XX:ThreadPriorityPolicy=1 -XX:+UseNUMA -XX:+UseDynamicNumberOfGCThreads -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=350M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -Dgraal.CompilerConfiguration=community");
-                    if std::env::consts::OS == "windows"{
-                        (format!("{}/dgrlauncher_java/java8/bin/javaw.exe", minecraft_directory), args)
-                    } else {
-                        (format!("{}/dgrlauncher_java/java8/bin/java", minecraft_directory), args)
-                    }
-                },
-                JavaType::LauncherJava17 => {
-                    let args = get_vec_from("-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseNUMA -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=400M -XX:NonNMethodCodeHeapSize=12M -XX:ProfiledCodeHeapSize=194M -XX:NonProfiledCodeHeapSize=194M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -XX:+UseVectorCmov -XX:+PerfDisableSharedMem -XX:+UseFastUnorderedTimeStamps -XX:+UseCriticalJavaThreadPriority -XX:ThreadPriorityPolicy=1 -XX:AllocatePrefetchStyle=3");
-                    if std::env::consts::OS == "windows"{
-                        (format!("{}/dgrlauncher_java/java17/bin/javaw.exe", minecraft_directory), args)
-                    } else {
-                        (format!("{}/dgrlauncher_java/java17/bin/java", minecraft_directory), args)
-                    }
-                },
-                JavaType::LauncherJava21 => {
-                    let args = get_vec_from("-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseNUMA -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=400M -XX:NonNMethodCodeHeapSize=12M -XX:ProfiledCodeHeapSize=194M -XX:NonProfiledCodeHeapSize=194M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -XX:+UseVectorCmov -XX:+PerfDisableSharedMem -XX:+UseFastUnorderedTimeStamps -XX:+UseCriticalJavaThreadPriority -XX:ThreadPriorityPolicy=1 -XX:AllocatePrefetchStyle=3");
-                    if std::env::consts::OS == "windows"{
-                        (format!("{}/dgrlauncher_java/java21/bin/javaw.exe", minecraft_directory), args)
-                    } else {
-                        (format!("{}/dgrlauncher_java/java21/bin/java", minecraft_directory), args)
-                    }
-                }
                 JavaType::Automatic => automatic_java(p.clone(), &game_settings.game_version, is_modded),
             };
             library_list.push_str(&format!(
@@ -740,52 +720,51 @@ fn get_game_jvm_args(p: &Value, nativedir: &str) -> Vec<String> {
     }
     version_jvm_args
 }
-fn automatic_java(mut p: Value, game_version: &String, ismodded: bool) -> (String, Vec<String>) {
+/// Vanilla version json for java lookup: for modded versions (loader json
+/// without `javaVersion`) the inherited vanilla json is used.
+fn version_json_for_java(p: &Value, mc_dir: &str, game_version: &str) -> Value {
+    if let Some(vanilla) = p["inheritsFrom"].as_str() {
+        let path = format!("{mc_dir}/versions/{game_version}/{vanilla}.json");
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str(&content) {
+                return v;
+            }
+        }
+    }
+    p.clone()
+}
+fn modded_aware_required_major(p: &Value, mc_dir: &str, game_version: &str) -> u64 {
+    let v = version_json_for_java(p, mc_dir, game_version);
+    required_java_major(&v, game_version)
+}
+fn automatic_java(p: Value, game_version: &String, ismodded: bool) -> (String, Vec<String>) {
     let mc_dir = get_minecraft_dir();
-    let (autojava21path, autojava17path, autojava8path) = if std::env::consts::OS == "windows" {
-        (
-            format!("{}/dgrlauncher_java/java21/bin/javaw.exe", mc_dir),
-            format!("{}/dgrlauncher_java/java17/bin/javaw.exe", mc_dir),
-            format!("{}/dgrlauncher_java/java8/bin/javaw.exe", mc_dir),
-        )
+    let lookup_json;
+    let lookup_ref = if ismodded {
+        lookup_json = version_json_for_java(&p, &mc_dir, game_version);
+        &lookup_json
     } else {
-        (
-            format!("{}/dgrlauncher_java/java21/bin/java", mc_dir),
-            format!("{}/dgrlauncher_java/java17/bin/java", mc_dir),
-            format!("{}/dgrlauncher_java/java8/bin/java", mc_dir),
-        )
+        &p
     };
-    if ismodded {
-        let vanillaversion = p["inheritsFrom"].as_str().unwrap_or(game_version.as_str());
-        let vanillajsonpathstring = format!(
-            "{}/versions/{}/{}.json",
-            &mc_dir, game_version, vanillaversion
-        );
-        let mut vanillajson = File::open(vanillajsonpathstring).unwrap();
-        let mut vjsoncontent = String::new();
-        vanillajson.read_to_string(&mut vjsoncontent).unwrap();
-        p = serde_json::from_str(&vjsoncontent).unwrap();
-    }
-    let requiredjavaversion = p["javaVersion"]["majorVersion"].as_i64().unwrap_or(0);
-    let java21args = "-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseNUMA -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=400M -XX:NonNMethodCodeHeapSize=12M -XX:ProfiledCodeHeapSize=194M -XX:NonProfiledCodeHeapSize=194M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -XX:+UseVectorCmov -XX:+PerfDisableSharedMem -XX:+UseFastUnorderedTimeStamps -XX:+UseCriticalJavaThreadPriority -XX:ThreadPriorityPolicy=1 -XX:AllocatePrefetchStyle=3";
-    let java17args = "-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseNUMA -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=400M -XX:NonNMethodCodeHeapSize=12M -XX:ProfiledCodeHeapSize=194M -XX:NonProfiledCodeHeapSize=194M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -XX:+UseVectorCmov -XX:+PerfDisableSharedMem -XX:+UseFastUnorderedTimeStamps -XX:+UseCriticalJavaThreadPriority -XX:ThreadPriorityPolicy=1 -XX:AllocatePrefetchStyle=3";
-    let java8args = "-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+ParallelRefProcEnabled -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:+AggressiveOpts -XX:MaxInlineLevel=15 -XX:MaxVectorSize=32 -XX:ThreadPriorityPolicy=1 -XX:+UseNUMA -XX:+UseDynamicNumberOfGCThreads -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=350M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -Dgraal.CompilerConfiguration=community";
-    if requiredjavaversion > 17 {
-        (
-            autojava21path,
-            java21args.split(' ').map(|s| s.to_owned()).collect(),
-        )
-    } else if requiredjavaversion > 8 || requiredjavaversion == 0 {
-        (
-            autojava17path,
-            java17args.split(' ').map(|s| s.to_owned()).collect(),
-        )
+    let required = required_java_major(lookup_ref, game_version);
+    let binary = if std::env::consts::OS == "windows" {
+        "javaw.exe"
     } else {
-        (
-            autojava8path,
-            java8args.split(' ').map(|s| s.to_owned()).collect(),
-        )
-    }
+        "java"
+    };
+    let path = format!(
+        "{}/dgrlauncher_java/{}/bin/{}",
+        mc_dir,
+        managed_java_folder(required),
+        binary
+    );
+    let modern_args = "-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseNUMA -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=400M -XX:NonNMethodCodeHeapSize=12M -XX:ProfiledCodeHeapSize=194M -XX:NonProfiledCodeHeapSize=194M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -XX:+UseVectorCmov -XX:+PerfDisableSharedMem -XX:+UseFastUnorderedTimeStamps -XX:+UseCriticalJavaThreadPriority -XX:ThreadPriorityPolicy=1 -XX:AllocatePrefetchStyle=3";
+    let java8args = "-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+ParallelRefProcEnabled -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:+AggressiveOpts -XX:MaxInlineLevel=15 -XX:MaxVectorSize=32 -XX:ThreadPriorityPolicy=1 -XX:+UseNUMA -XX:+UseDynamicNumberOfGCThreads -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=350M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -Dgraal.CompilerConfiguration=community";
+    let args = if required == 8 { java8args } else { modern_args };
+    (
+        path,
+        args.split(' ').map(|s| s.to_owned()).collect(),
+    )
 }
 fn lib_manager(p: &Value) -> String {
     let os = std::env::consts::OS;

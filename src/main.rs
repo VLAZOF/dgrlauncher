@@ -27,6 +27,7 @@ mod theme;
 use theme::Theme;
 mod auth;
 mod screens;
+mod system_java;
 mod update_manager;
 fn load_window_icon() -> Option<window::icon::Icon> {
     let bytes = include_bytes!("icons/dgrlauncher.png");
@@ -90,9 +91,10 @@ struct DgrLauncher {
     download_text: String,
     files_download_number: i32,
     needs_to_update_download_list: bool,
-    jvm_to_add_name: String,
-    jvm_to_add_path: String,
-    jvm_to_add_flags: String,
+    detected_javas: Vec<system_java::SystemJava>,
+    java_scan_status: String,
+    custom_java_path: String,
+    custom_java_flags: String,
     restrict_launch: bool,
     java_download_size: u8,
     game_proccess: GameProcess,
@@ -126,7 +128,7 @@ pub enum Screen {
     Main,
     Settings,
     Installation,
-    Java,
+    CustomJava,
     Logs,
     ModifyCommand,
     InfoAndUpdates,
@@ -158,10 +160,12 @@ enum Message {
     OpenGameFolder,
     OpenGameInstanceFolder,
     ChangeScreen(Screen),
-    JvmNameToAddChanged(String),
-    JvmPathToAddChanged(String),
-    JvmFlagsToAddChanged(String),
-    JvmAdded,
+    ScanSystemJavas,
+    GotSystemJavas(Vec<system_java::SystemJava>),
+    CustomJavaPathChanged(String),
+    CustomJavaFlagsChanged(String),
+    DetectedJavaSelected(String),
+    SaveCustomJava,
     CheckedUpdates(Result<(String, String), String>),
     RecheckUpdates,
     Update,
@@ -206,12 +210,9 @@ impl DgrLauncher {
             HashMap::new()
         };
         let java_type = match self.current_java_name.as_str() {
-            "Automatic" => launcher::JavaType::Automatic,
             "System Java" => launcher::JavaType::System,
-            "Java 8 (DgrLauncher)" => launcher::JavaType::LauncherJava8,
-            "Java 17 (DgrLauncher)" => launcher::JavaType::LauncherJava17,
-            "Java 21 (DgrLauncher)" => launcher::JavaType::LauncherJava21,
-            _ => launcher::JavaType::Custom,
+            "Custom" => launcher::JavaType::Custom,
+            _ => launcher::JavaType::Automatic,
         };
         let game_settings = launcher::GameSettings {
             account: self.current_account_mc_data.clone(),
@@ -247,22 +248,20 @@ fn boot() -> (DgrLauncher, Task<Message>) {
             path: String::new(),
             flags: String::new(),
         };
-        currentjava.name = p["current_java_name"].as_str().unwrap().to_string();
-        let mut jvmnames: Vec<String> = Vec::new();
-        if let Some(jvms) = p["JVMs"].as_array() {
-            for jvm in jvms {
-                jvmnames.push(jvm["name"].as_str().unwrap().to_owned());
-                if jvm["name"] == p["current_java_name"] {
-                    currentjava.path = jvm["path"].as_str().unwrap().to_owned();
-                    currentjava.flags = jvm["flags"].as_str().unwrap().to_owned();
-                }
-            }
+        currentjava.name = sanitize_java_name(p["current_java_name"].as_str().unwrap());
+        // Migrate old configs ("Java 8 (DgrLauncher)", removed custom names...).
+        if currentjava.name != p["current_java_name"].as_str().unwrap() {
+            persist_current_java_name(&currentjava.name);
         }
-        jvmnames.push("Automatic".to_owned());
-        jvmnames.push("System Java".to_owned());
-        jvmnames.push("Java 8 (DgrLauncher)".to_owned());
-        jvmnames.push("Java 17 (DgrLauncher)".to_owned());
-        jvmnames.push("Java 21 (DgrLauncher)".to_owned());
+        if currentjava.name == "Custom" {
+            currentjava.path = p["custom_java_path"].as_str().unwrap_or("").to_owned();
+            currentjava.flags = p["custom_java_flags"].as_str().unwrap_or("").to_owned();
+        }
+        let jvmnames = vec![
+            "Automatic".to_owned(),
+            "System Java".to_owned(),
+            "Custom".to_owned(),
+        ];
         let mc_dir = launcher::get_minecraft_dir();
         let game_instance_folder_path = format!("{}/dgrlauncher_instances", mc_dir);
         if !Path::new(&game_instance_folder_path).exists() {
@@ -334,6 +333,8 @@ fn boot() -> (DgrLauncher, Task<Message>) {
                     .to_owned(),
                 show_all_versions_in_download_list: p["show_all_versions"].as_bool().unwrap(),
                 java_name_list: jvmnames,
+                custom_java_path: p["custom_java_path"].as_str().unwrap_or("").to_owned(),
+                custom_java_flags: p["custom_java_flags"].as_str().unwrap_or("").to_owned(),
                 needs_to_update_download_list: true,
                 accounts,
                 is_first_launcher_use,
@@ -356,6 +357,12 @@ impl DgrLauncher {
     fn update(state: &mut DgrLauncher, message: Message) -> Task<Message> {
         match message {
             Message::Launch => {
+                if state.current_java_name == "Custom" && state.current_java.path.trim().is_empty()
+                {
+                    state.game_state_text =
+                        String::from("Set a custom Java path first (Settings > Custom Java).");
+                    return Task::none();
+                }
                 if !state.restrict_launch
                     && !state.current_account.username.is_empty()
                     && !state.current_version.is_empty()
@@ -386,32 +393,18 @@ impl DgrLauncher {
                     launcher::Progress::Checked(missing) => {
                         if let Some(missing) = missing {
                             match missing {
-                                launcher::Missing::Java8 => {
+                                launcher::Missing::Java(major) => {
                                     state.launcher.state = LauncherState::Waiting;
+                                    state.game_state_text = format!(
+                                        "Downloading Java {major}..."
+                                    );
                                     state.downloaders.push(Downloader {
                                         state: DownloaderState::Idle,
                                         id: state.downloaders.len(),
                                     });
                                     let index = state.downloaders.len() - 1;
-                                    state.downloaders[index].start_java(downloader::Java::J8)
-                                }
-                                launcher::Missing::Java17 => {
-                                    state.launcher.state = LauncherState::Waiting;
-                                    state.downloaders.push(Downloader {
-                                        state: DownloaderState::Idle,
-                                        id: state.downloaders.len(),
-                                    });
-                                    let index = state.downloaders.len() - 1;
-                                    state.downloaders[index].start_java(downloader::Java::J17)
-                                }
-                                launcher::Missing::Java21 => {
-                                    state.launcher.state = LauncherState::Waiting;
-                                    state.downloaders.push(Downloader {
-                                        state: DownloaderState::Idle,
-                                        id: state.downloaders.len(),
-                                    });
-                                    let index = state.downloaders.len() - 1;
-                                    state.downloaders[index].start_java(downloader::Java::J21)
+                                    state.downloaders[index]
+                                        .start_java(downloader::Java(major))
                                 }
                                 launcher::Missing::VersionFiles(vec) => {
                                     state.game_state_text =
@@ -544,42 +537,76 @@ impl DgrLauncher {
                 Task::none()
             }
             Message::JavaChanged(selected_jvm_name) => {
-                set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
-                let mut newjvm: Vec<String> = Vec::new();
-                let mut newjvmname: String = String::new();
-                if selected_jvm_name.as_str() == "System Java"
-                    || selected_jvm_name.as_str() == "Automatic"
-                    || selected_jvm_name.as_str() == "Java 8 (DgrLauncher)"
-                    || selected_jvm_name.as_str() == "Java 17 (DgrLauncher)"
-                    || selected_jvm_name.as_str() == "Java 21 (DgrLauncher)"
-                {
-                    newjvm.push(selected_jvm_name.clone());
-                    newjvm.push(String::new());
-                    newjvm.push(String::new());
-                    newjvmname = selected_jvm_name;
-                } else {
-                    let mut file = File::open(get_config_file_path()).unwrap();
-                    let mut fcontent = String::new();
-                    file.read_to_string(&mut fcontent).unwrap();
-                    let content = serde_json::from_str(&fcontent);
-                    let p: Value = content.unwrap();
-                    if let Some(jvms) = p["JVMs"].as_array() {
-                        for jvm in jvms {
-                            if jvm["name"] == selected_jvm_name {
-                                newjvm.push(jvm["name"].as_str().unwrap().to_owned());
-                                newjvm.push(jvm["path"].as_str().unwrap().to_owned());
-                                newjvm.push(jvm["flags"].as_str().unwrap().to_owned());
-                                newjvmname = jvm["name"].as_str().unwrap().to_owned();
-                            }
-                        }
+                let name = sanitize_java_name(&selected_jvm_name);
+                state.current_java_name = name.clone();
+                state.current_java = if name == "Custom" {
+                    let config = getjson(get_config_file_path());
+                    Java {
+                        name,
+                        path: config["custom_java_path"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_owned(),
+                        flags: config["custom_java_flags"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_owned(),
                     }
-                }
-                state.current_java_name = newjvmname;
-                state.current_java = Java {
-                    name: newjvm[0].clone(),
-                    path: newjvm[1].clone(),
-                    flags: newjvm[2].clone(),
+                } else {
+                    Java {
+                        name,
+                        path: String::new(),
+                        flags: String::new(),
+                    }
                 };
+                persist_current_java_name(&state.current_java_name);
+                Task::none()
+            }
+            Message::ScanSystemJavas => {
+                state.java_scan_status = String::from("Scanning for installed Java...");
+                Task::perform(system_java::scan_system_javas(), Message::GotSystemJavas)
+            }
+            Message::GotSystemJavas(found) => {
+                if found.is_empty() {
+                    state.java_scan_status =
+                        String::from("No Java installations found. Enter the path manually.");
+                } else {
+                    state.java_scan_status =
+                        format!("Found {} Java installation(s).", found.len());
+                }
+                state.detected_javas = found;
+                Task::none()
+            }
+            Message::CustomJavaPathChanged(path) => {
+                state.custom_java_path = path;
+                Task::none()
+            }
+            Message::CustomJavaFlagsChanged(flags) => {
+                state.custom_java_flags = flags;
+                Task::none()
+            }
+            Message::DetectedJavaSelected(path) => {
+                state.custom_java_path = path;
+                Task::none()
+            }
+            Message::SaveCustomJava => {
+                if state.custom_java_path.trim().is_empty() {
+                    state.java_scan_status =
+                        String::from("Enter a Java path or pick one from the scan results.");
+                    return Task::none();
+                }
+                persist_custom_java(
+                    state.custom_java_path.trim(),
+                    state.custom_java_flags.trim(),
+                );
+                state.current_java_name = String::from("Custom");
+                state.current_java = Java {
+                    name: String::from("Custom"),
+                    path: state.custom_java_path.trim().to_owned(),
+                    flags: state.custom_java_flags.trim().to_owned(),
+                };
+                persist_current_java_name(&state.current_java_name);
+                state.screen = Screen::Settings;
                 Task::none()
             }
             Message::GameRamChanged(new_ram) => {
@@ -636,49 +663,6 @@ impl DgrLauncher {
                     .push(Downloader::new(state.downloaders.len()));
                 let index = state.downloaders.len() - 1;
                 state.downloaders[index].start(version, ver_type);
-                Task::none()
-            }
-            Message::JvmNameToAddChanged(name) => {
-                state.jvm_to_add_name = name;
-                Task::none()
-            }
-            Message::JvmPathToAddChanged(path) => {
-                state.jvm_to_add_path = path;
-                Task::none()
-            }
-            Message::JvmFlagsToAddChanged(flags) => {
-                state.jvm_to_add_flags = flags;
-                Task::none()
-            }
-            Message::JvmAdded => {
-                if !state.jvm_to_add_name.is_empty() && !state.jvm_to_add_path.is_empty() {
-                    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
-                    let mut data = getjson(get_config_file_path());
-                    let new_jvm = Java {
-                        name: state.jvm_to_add_name.clone(),
-                        path: state.jvm_to_add_path.clone(),
-                        flags: state.jvm_to_add_flags.clone(),
-                    };
-                    if let Value::Array(arr) = &mut data["JVMs"] {
-                        arr.push(serde_json::json!(new_jvm));
-                        data["JVMs"] = serde_json::json!(arr)
-                    }
-                    let mut updatedjvmlist = Vec::new();
-                    if let Some(jvms) = data["JVMs"].as_array() {
-                        for jvm in jvms {
-                            updatedjvmlist.push(jvm["name"].as_str().unwrap().to_owned());
-                        }
-                    }
-                    state.java_name_list = updatedjvmlist;
-                    let serialized = serde_json::to_string_pretty(&data).unwrap();
-                    let mut file = OpenOptions::new()
-                        .write(true)
-                        .truncate(true)
-                        .open(get_config_file_path())
-                        .unwrap();
-                    file.write_all(serialized.as_bytes()).unwrap();
-                    state.screen = Screen::Settings;
-                }
                 Task::none()
             }
             Message::ManageDownload((id, progress)) => {
@@ -1156,9 +1140,17 @@ fn checksettingsfile() -> bool {
     };
     let mut file = File::create(get_config_file_path()).unwrap();
     if let Value::Object(map) = &mut conf_json {
-        if !map.contains_key("JVMs") {
-            let jvm: Vec<Java> = vec![];
-            map.insert("JVMs".to_owned(), serde_json::to_value(jvm).unwrap());
+        if !map.contains_key("custom_java_path") {
+            map.insert(
+                "custom_java_path".to_owned(),
+                serde_json::to_value(String::new()).unwrap(),
+            );
+        }
+        if !map.contains_key("custom_java_flags") {
+            map.insert(
+                "custom_java_flags".to_owned(),
+                serde_json::to_value(String::new()).unwrap(),
+            );
         }
         if !map.contains_key("accounts") {
             let accounts: Vec<Account> = vec![];
@@ -1268,6 +1260,63 @@ fn persist_current_account(current_account: &Account) {
     if let Err(e) = file.write_all(serialized.as_bytes()) {
         println!("Failed to persist current account: {e}");
     }
+}
+/// Only these Java selections exist now; old configs (e.g. "Java 8
+/// (DgrLauncher)" or removed custom names) fall back to Automatic.
+fn sanitize_java_name(name: &str) -> String {
+    match name {
+        "Automatic" | "System Java" | "Custom" => name.to_owned(),
+        _ => String::from("Automatic"),
+    }
+}
+fn persist_config_keys(keys: &[(&str, String)]) {
+    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
+    let mut file = match File::open(get_config_file_path()) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("Failed to persist java settings: {e}");
+            return;
+        }
+    };
+    let mut contents = String::new();
+    if file.read_to_string(&mut contents).is_err() {
+        println!("Failed to persist java settings: cannot read config");
+        return;
+    }
+    let mut data: Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("Failed to persist java settings: {e}");
+            return;
+        }
+    };
+    for (key, value) in keys {
+        data[*key] = serde_json::Value::String(value.clone());
+    }
+    let serialized = serde_json::to_string_pretty(&data).unwrap();
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(get_config_file_path())
+    {
+        Ok(f) => f,
+        Err(e) => {
+            println!("Failed to persist java settings: {e}");
+            return;
+        }
+    };
+    if let Err(e) = file.write_all(serialized.as_bytes()) {
+        println!("Failed to persist java settings: {e}");
+    }
+}
+fn persist_current_java_name(name: &str) {
+    persist_config_keys(&[("current_java_name", name.to_owned())]);
+}
+fn persist_custom_java(path: &str, flags: &str) {
+    persist_config_keys(&[
+        ("custom_java_path", path.to_owned()),
+        ("custom_java_flags", flags.to_owned()),
+    ]);
 }
 fn save_account(account: Account) -> Vec<Account> {
     set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();

@@ -80,11 +80,24 @@ pub fn start<I: 'static + Hash + Copy + Send + Sync>(
         })
     })
 }
+/// Launcher-managed Temurin JRE identified by Java major version.
+/// Downloaded from the Adoptium API on demand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Java {
-    J8,
-    J17,
-    J21,
+pub struct Java(pub u64);
+/// Stable download URL for the latest GA Temurin JRE of a major version.
+/// Redirects to the actual binary; reqwest follows them.
+pub fn temurin_jre_url(major: u64) -> String {
+    let os = match std::env::consts::OS {
+        "windows" => "windows",
+        "linux" => "linux",
+        _ => "linux",
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "aarch64",
+        _ => "x64",
+    };
+    format!("https://api.adoptium.net/v3/binary/latest/{major}/ga/{os}/{arch}/jre/hotspot/normal/eclipse")
 }
 pub fn start_java<I: 'static + Hash + Copy + Send + Sync>(
     id: I,
@@ -369,29 +382,7 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
         State::Idle => iced::futures::future::pending().await,
         State::PreparingJavaDownload(java) => {
             let os = std::env::consts::OS;
-            let java_url = match java{
-                Java::J8 => {
-                    match os{
-                        "windows" => "https://github.com/adoptium/temurin8-binaries/releases/download/jdk8u412-b08/OpenJDK8U-jre_x64_windows_hotspot_8u412b08.zip",
-                        "linux" => "https://github.com/adoptium/temurin8-binaries/releases/download/jdk8u412-b08/OpenJDK8U-jre_x64_linux_hotspot_8u412b08.tar.gz",
-                        _ => panic!("Unsuported system.")
-                    }
-                },
-                Java::J17 => {
-                    match os{
-                        "windows" => "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.9%2B9.1/OpenJDK17U-jre_x64_windows_hotspot_17.0.9_9.zip",
-                        "linux" => "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.11%2B9/OpenJDK17U-jre_x64_linux_hotspot_17.0.11_9.tar.gz",
-                        _ => panic!("Unsuported system.")
-                    }
-                },
-                Java::J21 => {
-                    match os{
-                        "windows" => "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.3%2B9/OpenJDK21U-jre_x64_windows_hotspot_21.0.3_9.zip",
-                        "linux" => "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.3%2B9/OpenJDK21U-jre_x64_linux_hotspot_21.0.3_9.tar.gz",
-                        _ => panic!("Unsuported system.")
-                    }
-                },
-            };
+            let java_url = temurin_jre_url(java.0);
             let mc_dir = match std::env::consts::OS {
                 "linux" => format!("{}/.minecraft", std::env::var("HOME").unwrap()),
                 "windows" => format!(
@@ -418,7 +409,7 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
                 };
             match download {
                 Ok(d) => {
-                    let size = d.content_length().unwrap();
+                    let size = d.content_length().unwrap_or(0);
                     (
                         (id, Progress::StartedJavaDownload((size / 1048576) as u8)),
                         State::DownloadingJava {
@@ -482,11 +473,7 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
                 Ok(ok) => ok,
                 Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
             };
-            let java_folder_name = match java {
-                Java::J8 => "java8",
-                Java::J17 => "java17",
-                Java::J21 => "java21",
-            };
+            let java_folder_name = format!("java{}", java.0);
             let mut f_folder_name = String::new();
             match os {
                 "windows" => {
