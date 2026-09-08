@@ -32,12 +32,30 @@ pub enum State {
         archive_path: String,
         archive_file: File,
     },
+    PreparingNeoForge {
+        mc_version: String,
+        neoforge_version: String,
+    },
+    DownloadingNeoForgeInstaller {
+        downloaded: u64,
+        total: u64,
+        download: reqwest::Response,
+        installer_path: String,
+        installer_file: File,
+        mc_version: String,
+        neoforge_version: String,
+    },
+    RunningNeoForgeInstaller {
+        mc_version: String,
+        neoforge_version: String,
+        installer_path: String,
+    },
     Idle,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum VersionType {
     Vanilla,
-    Fabric,
+    Fabric { loader: String },
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Progress {
@@ -53,6 +71,12 @@ pub enum Progress {
     UpdateStarted(u8),
     UpdateProgressed(u8, u8, u8),
     UpdateFinished,
+    /// Managed Java `major` must be downloaded first (resume afterwards).
+    NeoForgeNeedsJava(u64),
+    /// Indeterminate status text for the NeoForge installer flow.
+    NeoForgeStatus(String),
+    /// NeoForge installed successfully (triggers version list refresh).
+    NeoForgeFinished,
     Errored(String),
 }
 pub fn start<I: 'static + Hash + Copy + Send + Sync>(
@@ -174,6 +198,139 @@ pub fn start_update<I: 'static + Hash + Copy + Send + Sync>(
         })
     })
 }
+pub fn start_neoforge<I: 'static + Hash + Copy + Send + Sync>(
+    id: I,
+    mc_version: String,
+    neoforge_version: String,
+) -> Subscription<(I, Progress)> {
+    Subscription::run_with((id, mc_version, neoforge_version), |data| {
+        let (id, mc_version, neoforge_version) = data.clone();
+        stream::channel(100, async move |mut output| {
+            let mut state = State::PreparingNeoForge {
+                mc_version,
+                neoforge_version,
+            };
+            loop {
+                match state {
+                    State::Idle => break,
+                    _ => {}
+                }
+                let ((out_id, progress), next_state) = download(id, state).await;
+                let finished = matches!(next_state, State::Idle);
+                let _ = output.send((out_id, progress)).await;
+                if finished {
+                    break;
+                }
+                state = next_state;
+            }
+        })
+    })
+}
+/// Stable URL of a NeoForge installer jar on the NeoForged Maven.
+pub fn neoforge_installer_url(neoforge_version: &str) -> String {
+    format!(
+        "https://maven.neoforged.net/releases/net/neoforged/neoforge/{v}/neoforge-{v}-installer.jar",
+        v = neoforge_version
+    )
+}
+/// Map a NeoForge version to its Minecraft version.
+/// Old scheme: `20.2.59` -> `1.20.2`, `21.1.213` -> `1.21.1`.
+/// New scheme: `26.1.0.5-beta` -> `26.1` (zero placeholder),
+/// `26.1.1.7` -> `26.1.1`.
+pub fn neoforge_mc_of_version(version: &str) -> Option<String> {
+    let core = version.split('-').next().unwrap_or(version);
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.iter().any(|p| p.parse::<u64>().is_err()) {
+        return None;
+    }
+    match parts.len() {
+        4 => {
+            if parts[2] == "0" {
+                Some(format!("{}.{}", parts[0], parts[1]))
+            } else {
+                Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]))
+            }
+        }
+        3 => {
+            if parts[0] == "1" {
+                Some(format!("1.{}.{}", parts[1], parts[2]))
+            } else {
+                // Old scheme omits the leading `1`: `21.1.213` -> `1.21.1`.
+                Some(format!("1.{}.{}", parts[0], parts[1]))
+            }
+        }
+        _ => None,
+    }
+}
+/// Full NeoForge version list from Maven metadata (latest first).
+/// Returns `(minecraft_version, neoforge_version)` pairs.
+pub async fn get_neoforge_versions() -> Result<Vec<(String, String)>, String> {
+    let text = match Client::new()
+        .get("https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml")
+        .send()
+        .await
+    {
+        Ok(ok) => match ok.text().await {
+            Ok(ok) => ok,
+            Err(e) => return Err(format!("Failed to read NeoForge version list: {e}")),
+        },
+        Err(e) => return Err(format!("Failed to fetch NeoForge version list: {e}. You can enter the version manually.")),
+    };
+    let mut versions = Vec::new();
+    // Minimal manual parse: maven-metadata is a flat list of <version>X</version>.
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find("<version>") {
+        rest = &rest[start + "<version>".len()..];
+        if let Some(end) = rest.find("</version>") {
+            versions.push(rest[..end].trim().to_owned());
+            rest = &rest[end + "</version>".len()..];
+        } else {
+            break;
+        }
+    }
+    if versions.is_empty() {
+        return Err("NeoForge version list is empty. You can enter the version manually.".to_string());
+    }
+    let mut pairs = Vec::new();
+    for v in versions.iter().rev() {
+        if let Some(mc) = neoforge_mc_of_version(v) {
+            pairs.push((mc, v.clone()));
+        }
+    }
+    Ok(pairs)
+}
+/// Fabric loader versions for a Minecraft version (latest first).
+pub async fn get_fabric_loader_versions(mc_version: &str) -> Result<Vec<String>, String> {
+    let text = match Client::new()
+        .get(format!(
+            "https://meta.fabricmc.net/v2/versions/loader/{mc_version}"
+        ))
+        .send()
+        .await
+    {
+        Ok(ok) => match ok.text().await {
+            Ok(ok) => ok,
+            Err(e) => return Err(format!("Failed to read Fabric loader list: {e}")),
+        },
+        Err(e) => return Err(format!("Failed to fetch Fabric loader list: {e}")),
+    };
+    let list: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return Err(format!("Failed to parse Fabric loader list: {e}")),
+    };
+    let mut loaders = Vec::new();
+    if let Some(arr) = list.as_array() {
+        for entry in arr {
+            if let Some(v) = entry["loader"]["version"].as_str() {
+                loaders.push(v.to_owned());
+            }
+        }
+    }
+    if loaders.is_empty() {
+        return Err(format!("No Fabric loader for {mc_version}"));
+    }
+    Ok(loaders)
+}
 #[derive(Clone)]
 pub struct DownloadList {
     pub download_list: Vec<Download>,
@@ -198,13 +355,13 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
                 ),
                 _ => panic!("System not supported."),
             };
-            let version_name = match version_type {
+            let version_name = match &version_type {
                 VersionType::Vanilla => version.clone(),
-                VersionType::Fabric => format!("{}-fabric", &version),
+                VersionType::Fabric { .. } => format!("{}-fabric", &version),
             };
             let version_folder = format!("{}/versions/{}", &mc_dir, version_name);
             let client = Client::new();
-            let vanilla_version_json = match version_type {
+            let vanilla_version_json = match &version_type {
                 VersionType::Vanilla => {
                     match downloadversionjson(&version_type, &version, &version_folder, &client)
                         .await
@@ -213,7 +370,7 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
                         Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
                     }
                 }
-                VersionType::Fabric => {
+                VersionType::Fabric { .. } => {
                     match downloadversionjson(&version_type, &version, &version_folder, &client)
                         .await
                     {
@@ -256,6 +413,9 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
             }
             let asset_index_json = super::getjson(asset_index_path);
             let mut download_list = vec![];
+            // The per-version client jar copy is required for vanilla and
+            // Fabric (Knot locates the game through it). NeoForge installs
+            // via its own installer flow and never reaches this code.
             download_list.push(Download {
                 path: format!("{}/{}.jar", version_folder, version_name),
                 url: vanilla_version_json["downloads"]["client"]["url"]
@@ -277,7 +437,7 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
                 Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
             };
             download_list.extend_from_slice(libraries);
-            if version_type == VersionType::Fabric {
+            if matches!(version_type, VersionType::Fabric { .. }) {
                 let libresult = &get_libraries(
                     &mc_dir,
                     version_json["libraries"].as_array().unwrap(),
@@ -378,6 +538,206 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
                     client: download_list.client,
                 }),
             )
+        }
+        State::PreparingNeoForge {
+            mc_version,
+            neoforge_version,
+        } => {
+            let mc_dir = super::launcher::get_minecraft_dir();
+            // Java required to run the installer: exact major from the
+            // vanilla json when present, table fallback otherwise.
+            let vanilla_path =
+                format!("{mc_dir}/versions/{mc_version}/{mc_version}.json");
+            let java_major = fs::read_to_string(&vanilla_path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+                .and_then(|v| v["javaVersion"]["majorVersion"].as_u64())
+                .unwrap_or_else(|| super::launcher::fallback_java_major(&mc_version));
+            let java_folder = format!(
+                "{mc_dir}/dgrlauncher_java/{}",
+                super::launcher::managed_java_folder(java_major)
+            );
+            if !Path::new(&java_folder).exists() {
+                return ((id, Progress::NeoForgeNeedsJava(java_major)), State::Idle);
+            }
+            // The installer refuses a directory without launcher_profiles.json.
+            let profiles = format!("{mc_dir}/launcher_profiles.json");
+            if !Path::new(&profiles).exists() {
+                if let Err(e) = fs::write(&profiles, "{\"profiles\":{}}") {
+                    return ((id, Progress::Errored(e.to_string())), State::Idle);
+                }
+            }
+            let downloads_dir = format!("{mc_dir}/downloads");
+            if let Err(e) = fs::create_dir_all(&downloads_dir) {
+                return ((id, Progress::Errored(e.to_string())), State::Idle);
+            }
+            let installer_path = format!(
+                "{downloads_dir}/neoforge-{neoforge_version}-installer.jar"
+            );
+            // Reuse a previously downloaded installer.
+            if Path::new(&installer_path).exists() {
+                return (
+                    (
+                        id,
+                        Progress::NeoForgeStatus(String::from("Running NeoForge installer...")),
+                    ),
+                    State::RunningNeoForgeInstaller {
+                        mc_version,
+                        neoforge_version,
+                        installer_path,
+                    },
+                );
+            }
+            let download = reqwest::get(neoforge_installer_url(&neoforge_version)).await;
+            match download {
+                Ok(d) => {
+                    let total = d.content_length().unwrap_or(0);
+                    let file = match File::create(&installer_path) {
+                        Ok(f) => f,
+                        Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
+                    };
+                    (
+                        (
+                            id,
+                            Progress::NeoForgeStatus(String::from(
+                                "Downloading NeoForge installer...",
+                            )),
+                        ),
+                        State::DownloadingNeoForgeInstaller {
+                            downloaded: 0,
+                            total,
+                            download: d,
+                            installer_path,
+                            installer_file: file,
+                            mc_version,
+                            neoforge_version,
+                        },
+                    )
+                }
+                Err(e) => ((id, Progress::Errored(e.to_string())), State::Idle),
+            }
+        }
+        State::DownloadingNeoForgeInstaller {
+            downloaded,
+            total,
+            mut download,
+            installer_path,
+            mut installer_file,
+            mc_version,
+            neoforge_version,
+        } => match download.chunk().await {
+            Ok(Some(chunk)) => {
+                let downloaded = downloaded + chunk.len() as u64;
+                if let Err(e) = std::io::Write::write_all(&mut installer_file, &chunk) {
+                    return ((id, Progress::Errored(e.to_string())), State::Idle);
+                }
+                let text = if total > 0 {
+                    format!(
+                        "Downloading NeoForge installer... {} / {} MiB",
+                        downloaded / 1048576,
+                        total / 1048576
+                    )
+                } else {
+                    format!(
+                        "Downloading NeoForge installer... {} MiB",
+                        downloaded / 1048576
+                    )
+                };
+                (
+                    (id, Progress::NeoForgeStatus(text)),
+                    State::DownloadingNeoForgeInstaller {
+                        downloaded,
+                        total,
+                        download,
+                        installer_path,
+                        installer_file,
+                        mc_version,
+                        neoforge_version,
+                    },
+                )
+            }
+            Ok(None) => (
+                (
+                    id,
+                    Progress::NeoForgeStatus(String::from("Running NeoForge installer...")),
+                ),
+                State::RunningNeoForgeInstaller {
+                    mc_version,
+                    neoforge_version,
+                    installer_path,
+                },
+            ),
+            Err(e) => ((id, Progress::Errored(e.to_string())), State::Idle),
+        },
+        State::RunningNeoForgeInstaller {
+            mc_version,
+            neoforge_version,
+            installer_path,
+        } => {
+            let mc_dir = super::launcher::get_minecraft_dir();
+            // Managed java for this MC version (ensured in PreparingNeoForge).
+            let vanilla_path =
+                format!("{mc_dir}/versions/{mc_version}/{mc_version}.json");
+            let java_major = fs::read_to_string(&vanilla_path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+                .and_then(|v| v["javaVersion"]["majorVersion"].as_u64())
+                .unwrap_or_else(|| super::launcher::fallback_java_major(&mc_version));
+            let java_bin = if std::env::consts::OS == "windows" {
+                format!(
+                    "{mc_dir}/dgrlauncher_java/{}/bin/javaw.exe",
+                    super::launcher::managed_java_folder(java_major)
+                )
+            } else {
+                format!(
+                    "{mc_dir}/dgrlauncher_java/{}/bin/java",
+                    super::launcher::managed_java_folder(java_major)
+                )
+            };
+            let output = tokio::process::Command::new(&java_bin)
+                .arg("-jar")
+                .arg(&installer_path)
+                .arg("--install-client")
+                .arg(&mc_dir)
+                .output()
+                .await;
+            match output {
+                Ok(out) if out.status.success() => {
+                    let version_id = format!("neoforge-{neoforge_version}");
+                    let produced =
+                        format!("{mc_dir}/versions/{version_id}/{version_id}.json");
+                    if Path::new(&produced).exists() {
+                        ((id, Progress::NeoForgeFinished), State::Idle)
+                    } else {
+                        (
+                            (
+                                id,
+                                Progress::Errored(format!(
+                                    "Installer finished but {produced} is missing."
+                                )),
+                            ),
+                            State::Idle,
+                        )
+                    }
+                }
+                Ok(out) => {
+                    let tail = String::from_utf8_lossy(&out.stderr);
+                    let tail: String =
+                        tail.lines().rev().take(5).collect::<Vec<_>>().join(" | ");
+                    (
+                        (
+                            id,
+                            Progress::Errored(format!(
+                                "NeoForge installer failed (exit {}): {}",
+                                out.status,
+                                tail.chars().take(300).collect::<String>()
+                            )),
+                        ),
+                        State::Idle,
+                    )
+                }
+                Err(e) => ((id, Progress::Errored(e.to_string())), State::Idle),
+            }
         }
         State::Idle => iced::futures::future::pending().await,
         State::PreparingJavaDownload(java) => {
@@ -798,7 +1158,7 @@ pub async fn downloadversionjson(
             let json: Value = content.unwrap();
             Ok(json)
         }
-        VersionType::Fabric => {
+        VersionType::Fabric { loader } => {
             let versionlistjson = reqwest::Client::new()
                 .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
                 .send()
@@ -827,19 +1187,7 @@ pub async fn downloadversionjson(
             fs::create_dir_all(foldertosave).unwrap();
             let mut jfile = File::create(jfilelocation).unwrap();
             jfile.write_all(&versionjson).unwrap();
-            let fabricloaderlist = client
-                .get("https://meta.fabricmc.net/v2/versions/loader")
-                .send()
-                .await?
-                .text()
-                .await?;
-            let content: Value = serde_json::from_str(&fabricloaderlist).unwrap();
-            let fabricloaderversion =
-                if let Some(first_object) = content.as_array().and_then(|arr| arr.first()) {
-                    first_object["version"].as_str().unwrap()
-                } else {
-                    panic!("Failed to get fabric loader name")
-                };
+            let fabricloaderversion = loader.clone();
             let verjson = client
                 .get(format!(
                     "https://meta.fabricmc.net/v2/versions/loader/{}/{}/profile/json",
@@ -968,16 +1316,14 @@ pub fn get_libraries(
                         &lpieces[&lpieces.len() - 1],
                         last_piece
                     );
-                    match fs::create_dir_all(format!(
-                        "{}/{}/{}",
-                        lib_dir,
-                        &firstpiece,
-                        &lpieces.join("/")
-                    )) {
+                    let libpath =
+                        super::launcher::artifact_path(library, &lib_dir, &lib);
+                    match fs::create_dir_all(
+                        Path::new(&libpath).parent().unwrap(),
+                    ) {
                         Ok(ok) => ok,
                         Err(err) => panic!("{err}"),
                     };
-                    let libpath = format!("{}{}", lib_dir, lib);
                     let unmodifiedurl = if !library["downloads"]["artifact"]["url"].is_null() {
                         library["downloads"]["artifact"]["url"].as_str().unwrap()
                     } else if !library["url"].is_null() {
@@ -996,16 +1342,14 @@ pub fn get_libraries(
                         &lpieces[&lpieces.len() - 2],
                         &lpieces[&lpieces.len() - 1]
                     );
-                    match fs::create_dir_all(format!(
-                        "{}/{}/{}",
-                        lib_dir,
-                        &firstpiece,
-                        &lpieces.join("/")
-                    )) {
+                    let libpath =
+                        super::launcher::artifact_path(library, &lib_dir, &lib);
+                    match fs::create_dir_all(
+                        Path::new(&libpath).parent().unwrap(),
+                    ) {
                         Ok(ok) => ok,
                         Err(err) => panic!("{err}"),
                     };
-                    let libpath = format!("{}{}", lib_dir, lib);
                     let unmodifiedurl = if !library["downloads"]["artifact"]["url"].is_null() {
                         library["downloads"]["artifact"]["url"].as_str().unwrap()
                     } else if !library["url"].is_null() {
@@ -1025,16 +1369,14 @@ pub fn get_libraries(
                         &lpieces[&lpieces.len() - 1],
                         os
                     );
-                    match fs::create_dir_all(format!(
-                        "{}/{}/{}",
-                        lib_dir,
-                        &firstpiece,
-                        &lpieces.join("/")
-                    )) {
+                    let libpath =
+                        super::launcher::artifact_path(library, &lib_dir, &lib);
+                    match fs::create_dir_all(
+                        Path::new(&libpath).parent().unwrap(),
+                    ) {
                         Ok(ok) => ok,
                         Err(err) => panic!("{err}"),
                     };
-                    let libpath = format!("{}{}", lib_dir, lib);
                     let unmodifiedurl = if !library["downloads"]["artifact"]["url"].is_null() {
                         library["downloads"]["artifact"]["url"].as_str().unwrap()
                     } else if !library["url"].is_null() {
@@ -1084,6 +1426,30 @@ fn get_library_url(unmodifiedurl: &str, lib: String) -> String {
         format!("https://libraries.minecraft.net/{}", lib)
     } else {
         unmodifiedurl.to_string()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::neoforge_mc_of_version;
+    #[test]
+    fn maps_neoforge_versions_to_mc() {
+        assert_eq!(
+            neoforge_mc_of_version("21.1.213"),
+            Some("1.21.1".to_string())
+        );
+        assert_eq!(
+            neoforge_mc_of_version("20.2.59"),
+            Some("1.20.2".to_string())
+        );
+        assert_eq!(
+            neoforge_mc_of_version("26.1.0.5-beta"),
+            Some("26.1".to_string())
+        );
+        assert_eq!(
+            neoforge_mc_of_version("26.1.1.7"),
+            Some("26.1.1".to_string())
+        );
+        assert_eq!(neoforge_mc_of_version("garbage"), None);
     }
 }
 pub fn get_assets(mc_dir: &String, asset_index_json: Value) -> Result<Vec<Download>, String> {

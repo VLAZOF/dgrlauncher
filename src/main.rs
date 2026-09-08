@@ -74,6 +74,7 @@ struct DgrLauncher {
     current_account: Account,
     current_account_mc_data: auth::MinecraftAccount,
     current_version: String,
+    current_version_info: String,
     game_state_text: String,
     game_state_text_2: String,
     game_ram: f64,
@@ -85,9 +86,16 @@ struct DgrLauncher {
     all_versions: Vec<String>,
     java_name_list: Vec<String>,
     vanilla_versions_download_list: Vec<String>,
-    fabric_versions_download_list: Vec<String>,
-    vanilla_version_to_download: String,
-    fabric_version_to_download: String,
+    install_mc_version: String,
+    install_loader: LoaderChoice,
+    fabric_loader_list: Vec<String>,
+    fabric_loader_selected: String,
+    neoforge_all: Vec<(String, String)>,
+    neoforge_versions_for_mc: Vec<String>,
+    neoforge_selected: String,
+    neoforge_manual: String,
+    neoforge_status: String,
+    pending_neoforge_install: Option<(String, String)>,
     download_text: String,
     files_download_number: i32,
     needs_to_update_download_list: bool,
@@ -115,6 +123,14 @@ struct Account {
     microsoft: bool,
     username: String,
     refresh_token: String,
+}
+/// Mod loader choice in the version installer. Exactly one can be active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoaderChoice {
+    #[default]
+    Vanilla,
+    Fabric,
+    NeoForge,
 }
 #[derive(Default)]
 enum GameProcess {
@@ -153,8 +169,14 @@ enum Message {
     ShowAllVersionsInDownloadListChanged(bool),
     GotDownloadList(Result<Vec<Vec<String>>, String>),
     VanillaVersionToDownloadChanged(String),
-    FabricVersionToDownloadChanged(String),
-    InstallVersion(downloader::VersionType),
+    InstallLoaderChanged(LoaderChoice),
+    FabricLoaderChanged(String),
+    GotFabricLoaders(Result<Vec<String>, String>),
+    GotNeoForgeList(Result<Vec<(String, String)>, String>),
+    ReloadNeoForgeList,
+    NeoForgeVersionChanged(String),
+    NeoForgeManualChanged(String),
+    InstallPressed,
     ManageDownload((usize, downloader::Progress)),
     VanillaJson(Value),
     OpenGameFolder,
@@ -171,6 +193,7 @@ enum Message {
     Update,
     OpenURL(String),
     CopyToClipboard(String),
+    CopyLogs,
     GotAuthCode(auth::AuthCode),
     ManageAuth((usize, auth::WaitProgress)),
     GotXboxToken(auth::XboxLiveData),
@@ -182,6 +205,21 @@ enum Message {
     Exit,
 }
 impl DgrLauncher {
+    /// Current NeoForge install target from the installer menu, if complete.
+    pub fn neoforge_install_target(&self) -> Option<(String, String)> {
+        if self.install_mc_version.is_empty() {
+            return None;
+        }
+        let nf = if !self.neoforge_manual.trim().is_empty() {
+            self.neoforge_manual.trim().to_owned()
+        } else {
+            self.neoforge_selected.clone()
+        };
+        if nf.is_empty() {
+            return None;
+        }
+        Some((self.install_mc_version.clone(), nf))
+    }
     pub fn launch(&mut self) {
         if updateusersettingsfile(self.current_account.clone(), self.current_version.clone())
             .is_err()
@@ -318,11 +356,14 @@ fn boot() -> (DgrLauncher, Task<Message>) {
             true => Screen::GettingStarted,
             false => Screen::Main,
         };
+        let current_version = p["current_version"].as_str().unwrap().to_owned();
+        let current_version_info = describe_version(&current_version);
         (
             DgrLauncher {
                 screen: initial_screen,
                 current_account: current_account,
-                current_version: p["current_version"].as_str().unwrap().to_owned(),
+                current_version,
+                current_version_info,
                 game_ram: p["game_ram"].as_f64().unwrap(),
                 current_java_name: currentjava.name.clone(),
                 current_java: currentjava,
@@ -469,6 +510,7 @@ impl DgrLauncher {
                 Task::none()
             }
             Message::VersionChanged(new_version) => {
+                state.current_version_info = describe_version(&new_version);
                 state.current_version = new_version;
                 Task::none()
             }
@@ -491,7 +533,6 @@ impl DgrLauncher {
                     }
                     Screen::Installation => {
                         if !state.vanilla_versions_download_list.is_empty()
-                            || !state.fabric_versions_download_list.is_empty()
                             || state.needs_to_update_download_list
                         {
                             let show_all_versions = state.show_all_versions_in_download_list;
@@ -631,14 +672,9 @@ impl DgrLauncher {
                         state.needs_to_update_download_list = false;
                         if !list.is_empty() {
                             state.vanilla_versions_download_list.clear();
-                            state.fabric_versions_download_list.clear();
                             for i in &list[0] {
                                 let ii = i;
                                 state.vanilla_versions_download_list.push(ii.to_string());
-                            }
-                            for i in &list[1] {
-                                let ii = i;
-                                state.fabric_versions_download_list.push(ii.to_string());
                             }
                         }
                     }
@@ -647,22 +683,163 @@ impl DgrLauncher {
                 Task::none()
             }
             Message::VanillaVersionToDownloadChanged(new_version) => {
-                state.vanilla_version_to_download = new_version;
+                state.install_mc_version = new_version.clone();
+                match state.install_loader {
+                    LoaderChoice::Fabric => {
+                        if new_version.is_empty() {
+                            return Task::none();
+                        }
+                        return Task::perform(
+                            async move {
+                                downloader::get_fabric_loader_versions(&new_version).await
+                            },
+                            Message::GotFabricLoaders,
+                        );
+                    }
+                    LoaderChoice::NeoForge => {
+                        filter_neoforge_for_mc(state);
+                        return Task::none();
+                    }
+                    LoaderChoice::Vanilla => {}
+                }
                 Task::none()
             }
-            Message::FabricVersionToDownloadChanged(new_version) => {
-                state.fabric_version_to_download = new_version;
+            Message::InstallLoaderChanged(loader) => {
+                state.install_loader = loader;
+                state.download_text = String::new();
+                match loader {
+                    LoaderChoice::Fabric => {
+                        if state.install_mc_version.is_empty() || !state.fabric_loader_list.is_empty() {
+                            return Task::none();
+                        }
+                        let mc = state.install_mc_version.clone();
+                        return Task::perform(
+                            async move {
+                                downloader::get_fabric_loader_versions(&mc).await
+                            },
+                            Message::GotFabricLoaders,
+                        );
+                    }
+                    LoaderChoice::NeoForge => {
+                        if state.neoforge_all.is_empty() {
+                            state.neoforge_status =
+                                String::from("Loading NeoForge versions...");
+                            return Task::perform(
+                                downloader::get_neoforge_versions(),
+                                Message::GotNeoForgeList,
+                            );
+                        }
+                        filter_neoforge_for_mc(state);
+                        return Task::none();
+                    }
+                    LoaderChoice::Vanilla => Task::none(),
+                }
+            }
+            Message::FabricLoaderChanged(loader) => {
+                state.fabric_loader_selected = loader;
                 Task::none()
             }
-            Message::InstallVersion(ver_type) => {
-                let version = match ver_type {
-                    downloader::VersionType::Vanilla => state.vanilla_version_to_download.clone(),
-                    downloader::VersionType::Fabric => state.fabric_version_to_download.clone(),
-                };
-                state.downloaders
-                    .push(Downloader::new(state.downloaders.len()));
-                let index = state.downloaders.len() - 1;
-                state.downloaders[index].start(version, ver_type);
+            Message::GotFabricLoaders(result) => {
+                match result {
+                    Ok(list) => {
+                        state.fabric_loader_list = list.clone();
+                        state.fabric_loader_selected =
+                            list.first().cloned().unwrap_or_default();
+                    }
+                    Err(err) => state.download_text = err,
+                }
+                Task::none()
+            }
+            Message::GotNeoForgeList(result) => {
+                match result {
+                    Ok(pairs) => {
+                        state.neoforge_all = pairs;
+                        state.neoforge_status = String::new();
+                        filter_neoforge_for_mc(state);
+                    }
+                    Err(err) => {
+                        state.neoforge_status = format!(
+                            "{err} (NeoForge Maven is unreachable; enter the version manually)"
+                        )
+                    }
+                }
+                Task::none()
+            }
+            Message::ReloadNeoForgeList => {
+                state.neoforge_status = String::from("Loading NeoForge versions...");
+                Task::perform(
+                    downloader::get_neoforge_versions(),
+                    Message::GotNeoForgeList,
+                )
+            }
+            Message::NeoForgeVersionChanged(version) => {
+                state.neoforge_selected = version;
+                state.neoforge_manual = String::new();
+                Task::none()
+            }
+            Message::NeoForgeManualChanged(version) => {
+                state.neoforge_manual = version;
+                Task::none()
+            }
+            Message::InstallPressed => {
+                if state.install_mc_version.is_empty() {
+                    state.download_text = String::from("Select a Minecraft version first.");
+                    return Task::none();
+                }
+                match state.install_loader {
+                    LoaderChoice::Vanilla => {
+                        let version = state.install_mc_version.clone();
+                        state.downloaders
+                            .push(Downloader::new(state.downloaders.len()));
+                        let index = state.downloaders.len() - 1;
+                        state.downloaders[index]
+                            .start(version, downloader::VersionType::Vanilla);
+                    }
+                    LoaderChoice::Fabric => {
+                        if state.fabric_loader_selected.is_empty() {
+                            state.download_text =
+                                String::from("Select a Fabric loader version first.");
+                            return Task::none();
+                        }
+                        let version = state.install_mc_version.clone();
+                        let loader = state.fabric_loader_selected.clone();
+                        state.downloaders
+                            .push(Downloader::new(state.downloaders.len()));
+                        let index = state.downloaders.len() - 1;
+                        state.downloaders[index].start(
+                            version,
+                            downloader::VersionType::Fabric { loader },
+                        );
+                    }
+                    LoaderChoice::NeoForge => {
+                        let nf = if !state.neoforge_manual.trim().is_empty() {
+                            state.neoforge_manual.trim().to_owned()
+                        } else {
+                            state.neoforge_selected.clone()
+                        };
+                        if nf.is_empty() {
+                            state.neoforge_status = String::from(
+                                "Select a NeoForge version or enter it manually.",
+                            );
+                            return Task::none();
+                        }
+                        let mc = state.install_mc_version.clone();
+                        // Remember the target through the whole chain
+                        // (vanilla prefetch -> installer -> optional java).
+                        state.pending_neoforge_install = Some((mc.clone(), nf));
+                        state.neoforge_status = String::from(
+                            "Downloading Minecraft files first...",
+                        );
+                        // Prefetch vanilla files so the game doesn't have to
+                        // download them on first launch; when this flow
+                        // finishes, the installer starts (see Finished).
+                        state.downloaders
+                            .push(Downloader::new(state.downloaders.len()));
+                        let index = state.downloaders.len() - 1;
+                        state.downloaders[index]
+                            .start(mc, downloader::VersionType::Vanilla);
+                    }
+                }
                 Task::none()
             }
             Message::ManageDownload((id, progress)) => {
@@ -690,6 +867,16 @@ impl DgrLauncher {
                                 break;
                             }
                         }
+                        // Vanilla prefetch for NeoForge done and nothing else
+                        // is downloading: continue with the installer.
+                        if state.downloaders.is_empty() {
+                            if let Some((mc, nf)) = state.pending_neoforge_install.clone() {
+                                state.downloaders
+                                    .push(Downloader::new(state.downloaders.len()));
+                                let index = state.downloaders.len() - 1;
+                                state.downloaders[index].start_neoforge(mc, nf);
+                            }
+                        }
                         if state.is_first_launcher_use{
                             state.is_first_launcher_use = false;
                             state.screen = Screen::Main;
@@ -698,6 +885,9 @@ impl DgrLauncher {
                     }
                     downloader::Progress::Errored(error) => {
                         state.download_text = format!("Failed to install: {error}");
+                        state.neoforge_status = format!("Failed to install: {error}");
+                        state.restrict_launch = false;
+                        state.pending_neoforge_install = None;
                         for (index, downloader) in state.downloaders.iter().enumerate() {
                             if downloader.id == id {
                                 state.downloaders.remove(index);
@@ -728,7 +918,54 @@ impl DgrLauncher {
                                 break;
                             }
                         }
+                        // Java downloaded for a pending NeoForge install:
+                        // continue with the installer instead of launching.
+                        if let Some((mc, nf)) = state.pending_neoforge_install.take() {
+                            state.downloaders
+                                .push(Downloader::new(state.downloaders.len()));
+                            let index = state.downloaders.len() - 1;
+                            state.downloaders[index].start_neoforge(mc, nf);
+                            return Task::none();
+                        }
                         state.launch();
+                    }
+                    downloader::Progress::NeoForgeNeedsJava(major) => {
+                        state.neoforge_status = format!(
+                            "Java {major} is required to run the installer. Downloading it first..."
+                        );
+                        state.restrict_launch = true;
+                        state.downloaders.push(Downloader {
+                            state: DownloaderState::Idle,
+                            id: state.downloaders.len(),
+                        });
+                        let index = state.downloaders.len() - 1;
+                        state.downloaders[index].start_java(downloader::Java(major));
+                        // Remembered when JavaExtracted arrives; cleared on error.
+                        if state.pending_neoforge_install.is_none() {
+                            state.pending_neoforge_install =
+                                state.neoforge_install_target();
+                        }
+                    }
+                    downloader::Progress::NeoForgeStatus(text) => {
+                        state.neoforge_status = text;
+                    }
+                    downloader::Progress::NeoForgeFinished => {
+                        state.restrict_launch = false;
+                        state.pending_neoforge_install = None;
+                        state.neoforge_status =
+                            String::from("NeoForge installed successfully.");
+                        state.download_text =
+                            String::from("NeoForge installed successfully.");
+                        for (index, downloader) in state.downloaders.iter().enumerate() {
+                            if downloader.id == id {
+                                state.downloaders.remove(index);
+                                break;
+                            }
+                        }
+                        return Task::perform(
+                            launcher::getinstalledversions(),
+                            Message::LoadVersionList,
+                        );
                     }
                     downloader::Progress::MissingFilesDownloadProgressed(missing_files) => {
                         state.restrict_launch = true;
@@ -815,6 +1052,7 @@ impl DgrLauncher {
                 if ver_list.len() == 1{
                     state.current_version = ver_list[0].clone()
                 }
+                state.current_version_info = describe_version(&state.current_version);
                 Task::none()
             }
             Message::GameEnviromentVariablesChanged(s) => {
@@ -929,6 +1167,7 @@ impl DgrLauncher {
                 Task::none()
             }
             Message::CopyToClipboard(content) => clipboard::write(content),
+            Message::CopyLogs => clipboard::write(state.logs.join("\n")),
             Message::CurrentAccountChanged(account_name) => {
                 for i in &state.accounts {
                     if i.username == account_name {
@@ -1261,6 +1500,67 @@ fn persist_current_account(current_account: &Account) {
         println!("Failed to persist current account: {e}");
     }
 }
+/// Human-readable description of an installed version, e.g.
+/// `Minecraft 1.21.1 • NeoForge 21.1.250`, so modded entries show
+/// which Minecraft version they are for.
+fn describe_version(id: &str) -> String {
+    if id.is_empty() {
+        return String::new();
+    }
+    let path = format!(
+        "{}/versions/{}/{}.json",
+        launcher::get_minecraft_dir(),
+        id,
+        id
+    );
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    let v: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    if let Some(mc) = v["inheritsFrom"].as_str() {
+        // Check "neoforge" before "forge": the former contains the latter.
+        let loader = if id.contains("neoforge") {
+            format!("NeoForge {}", id.trim_start_matches("neoforge-"))
+        } else if id.contains("fabric") {
+            "Fabric".to_string()
+        } else if id.contains("forge") {
+            "Forge".to_string()
+        } else {
+            "Modded".to_string()
+        };
+        format!("Minecraft {mc} \u{2022} {loader}")
+    } else {
+        format!("Minecraft {id}")
+    }
+}
+/// Keep the NeoForge version list in sync with the chosen MC version.
+/// The cached full list is latest-first, so the first match is preselected.
+fn filter_neoforge_for_mc(state: &mut DgrLauncher) {
+    state.neoforge_versions_for_mc = state
+        .neoforge_all
+        .iter()
+        .filter(|(mc, _)| *mc == state.install_mc_version)
+        .map(|(_, nf)| nf.clone())
+        .collect();
+    state.neoforge_selected = state
+        .neoforge_versions_for_mc
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    state.neoforge_manual = String::new();
+    if state.neoforge_versions_for_mc.is_empty() && !state.install_mc_version.is_empty() {
+        state.neoforge_status = format!(
+            "No NeoForge found for {}. Enter the version manually.",
+            state.install_mc_version
+        );
+    } else if !state.neoforge_all.is_empty() {
+        state.neoforge_status = String::new();
+    }
+}
 /// Only these Java selections exist now; old configs (e.g. "Java 8
 /// (DgrLauncher)" or removed custom names) fall back to Automatic.
 fn sanitize_java_name(name: &str) -> String {
@@ -1423,6 +1723,7 @@ enum DownloaderState {
     JavaDownloading(downloader::Java),
     DownloadingMissingFiles(Vec<downloader::Download>),
     Update(String),
+    NeoForgeInstaller { mc_version: String, nf_version: String },
 }
 impl Default for Downloader {
     fn default() -> Self {
@@ -1451,6 +1752,12 @@ impl Downloader {
     pub fn start_missing_files(&mut self, files: Vec<downloader::Download>) {
         self.state = DownloaderState::DownloadingMissingFiles(files)
     }
+    pub fn start_neoforge(&mut self, mc_version: String, nf_version: String) {
+        self.state = DownloaderState::NeoForgeInstaller {
+            mc_version,
+            nf_version,
+        }
+    }
     pub fn subscription(&self) -> Subscription<Message> {
         match &self.state {
             DownloaderState::Idle => Subscription::none(),
@@ -1468,6 +1775,11 @@ impl Downloader {
             DownloaderState::Update(url) => {
                 downloader::start_update(self.id, url.to_string()).map(Message::ManageDownload)
             }
+            DownloaderState::NeoForgeInstaller {
+                mc_version,
+                nf_version,
+            } => downloader::start_neoforge(self.id, mc_version.clone(), nf_version.clone())
+                .map(Message::ManageDownload),
         }
     }
 }

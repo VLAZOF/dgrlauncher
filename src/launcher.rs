@@ -48,6 +48,32 @@ pub enum JavaType {
 pub fn managed_java_folder(major: u64) -> String {
     format!("java{major}")
 }
+/// Absolute library path, preferring the exact `downloads.artifact.path`
+/// from the version json. The manual layout computation is only a fallback:
+/// it is wrong for 4-part coordinates (e.g. `mergetool:2.0.0:api`).
+pub(crate) fn artifact_path(
+    library: &Value,
+    lib_dir: &str,
+    computed_relative: &str,
+) -> String {
+    if let Some(p) = library["downloads"]["artifact"]["path"].as_str() {
+        format!("{lib_dir}{p}")
+    } else {
+        format!("{lib_dir}{computed_relative}")
+    }
+}
+/// Join classpath entries, dropping duplicates (loader and vanilla jsons
+/// overlap; duplicate jars crash NeoForge's union filesystem).
+pub(crate) fn dedupe_classpath(classpath: &str, separator: char) -> String {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    classpath
+        .split(separator)
+        .filter(|s| !s.is_empty())
+        .filter(|s| seen.insert(s.to_string()))
+        .collect::<Vec<_>>()
+        .join(&separator.to_string())
+}
 /// Required Java major for a version. Mirrors the official launcher:
 /// `javaVersion.majorVersion` from the version json (following `inheritsFrom`
 /// for modded versions). Old versions without the field fall back to a table.
@@ -60,7 +86,7 @@ pub fn required_java_major(version_json: &Value, game_version: &str) -> u64 {
     }
     fallback_java_major(game_version)
 }
-fn fallback_java_major(game_version: &str) -> u64 {
+pub(crate) fn fallback_java_major(game_version: &str) -> u64 {
     // Strip loader suffixes like "1.21.1-fabric".
     let base = game_version.split('-').next().unwrap_or(game_version);
     let mut parts = base.split('.');
@@ -213,15 +239,22 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                     }
                 }
             }
-            let is_natives_folder_empty = match fs::read_dir(format!("{}/natives", version_dir)) {
-                Ok(ok) => ok.count() == 0,
-                Err(_) => {
-                    println!("Natives folder not found, ignoring.");
-                    false
-                }
+            // Natives are usable only if already extracted. A missing (or
+            // empty) folder, e.g. after a NeoForge installer run, means the
+            // natives jars must still be downloaded.
+            let natives_ready = match fs::read_dir(format!("{}/natives", version_dir)) {
+                Ok(entries) => entries.count() > 0,
+                Err(_) => false,
             };
             let mut missing_files_list = Vec::new();
             let modded = !p["inheritsFrom"].is_null();
+            // Only BootstrapLauncher-based loaders (NeoForge) run without a
+            // per-version game jar. Fabric's Knot locates the game through it,
+            // vanilla needs it as the game itself.
+            let skip_version_jar = modded
+                && p["mainClass"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("bootstraplauncher"));
             if modded {
                 match super::downloader::get_libraries(
                     &minecraft_dir,
@@ -231,13 +264,8 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                     Ok(ok) => {
                         for i in ok {
                             if !Path::new(&i.path).exists() {
-                                if i.path.contains("natives.jar") {
-                                    if is_natives_folder_empty {
-                                        missing_files_list.push(i);
-                                        continue;
-                                    } else {
-                                        continue;
-                                    }
+                                if i.path.contains("natives.jar") && natives_ready {
+                                    continue;
                                 }
                                 missing_files_list.push(i);
                             }
@@ -261,21 +289,24 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                 let content = serde_json::from_str(&vanilla_json_content);
                 p = content.unwrap();
             }
-            let version_jar_path = format!(
-                "{}/versions/{}/{}.jar",
-                minecraft_dir, game_settings.game_version, game_settings.game_version
-            );
-            if !Path::new(&version_jar_path).exists()
-                || (Path::new(&version_jar_path).exists()
-                    && super::is_file_empty(&version_jar_path))
-            {
-                missing_files_list.push(super::downloader::Download {
-                    path: version_jar_path,
-                    url: p["downloads"]["client"]["url"]
-                        .as_str()
-                        .unwrap()
-                        .to_string(),
-                })
+            // Modded BootstrapLauncher versions (NeoForge) run from
+            // libraries; the per-version jar is required otherwise.
+            if !skip_version_jar {
+                let version_jar_path = format!(
+                    "{}/versions/{}/{}.jar",
+                    minecraft_dir, game_settings.game_version, game_settings.game_version
+                );
+                if !Path::new(&version_jar_path).exists()
+                    || (Path::new(&version_jar_path).exists()
+                        && super::is_file_empty(&version_jar_path))
+                {
+                    if let Some(url) = p["downloads"]["client"]["url"].as_str() {
+                        missing_files_list.push(super::downloader::Download {
+                            path: version_jar_path,
+                            url: url.to_string(),
+                        })
+                    }
+                }
             }
             match super::downloader::get_libraries(
                 &minecraft_dir,
@@ -285,13 +316,8 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                 Ok(ok) => {
                     for i in ok {
                         if !Path::new(&i.path).exists() {
-                            if i.path.contains("natives.jar") {
-                                if is_natives_folder_empty {
-                                    missing_files_list.push(i);
-                                    continue;
-                                } else {
-                                    continue;
-                                }
+                            if i.path.contains("natives.jar") && natives_ready {
+                                continue;
                             }
                             missing_files_list.push(i);
                         }
@@ -439,7 +465,7 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                 false
             };
             let (java_path, java_args) = match game_settings.java_type{
-                JavaType::System => ("java".to_owned(), get_vec_from("-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseNUMA -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=400M -XX:NonNMethodCodeHeapSize=12M -XX:ProfiledCodeHeapSize=194M -XX:NonProfiledCodeHeapSize=194M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -XX:+UseVectorCmov -XX:+PerfDisableSharedMem -XX:+UseFastUnorderedTimeStamps -XX:+UseCriticalJavaThreadPriority -XX:ThreadPriorityPolicy=1 -XX:AllocatePrefetchStyle=3")),
+                JavaType::System => ("java".to_owned(), get_vec_from("-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseNUMA -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=400M -XX:NonNMethodCodeHeapSize=12M -XX:ProfiledCodeHeapSize=194M -XX:NonProfiledCodeHeapSize=194M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -XX:+UseVectorCmov -XX:+PerfDisableSharedMem -XX:+UseFastUnorderedTimeStamps -XX:AllocatePrefetchStyle=3")),
                 JavaType::Custom => (game_settings.jvm, game_settings.jvmargs),
                 JavaType::Automatic => automatic_java(p.clone(), &game_settings.game_version, is_modded),
             };
@@ -447,23 +473,36 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                 "{}/versions/{}/{}.jar",
                 &minecraft_directory, game_settings.game_version, game_settings.game_version
             ));
-            if let Some(arguments) = p["arguments"]["game"].as_array() {
-                let mut str_arguments = vec![];
-                for i in arguments {
-                    if i.is_string() {
-                        str_arguments.push(i.as_str().unwrap_or("").to_owned())
-                    } else if i["value"].is_string() {
-                        str_arguments.push(i["value"].as_str().unwrap().to_owned())
+            // Loader and vanilla jsons overlap (11 libs for NeoForge);
+            // duplicates crash modded union filesystems, so drop them.
+            let separator = match std::env::consts::OS {
+                "linux" => ':',
+                "windows" => ';',
+                _ => panic!(),
+            };
+            library_list = dedupe_classpath(&library_list, separator);
+            // For modded versions modded() already merged the loader's own
+            // args with the vanilla ones; re-adding p's args here would
+            // duplicate bootstrap flags (e.g. --launchTarget).
+            if !is_modded {
+                if let Some(arguments) = p["arguments"]["game"].as_array() {
+                    let mut str_arguments = vec![];
+                    for i in arguments {
+                        if i.is_string() {
+                            str_arguments.push(i.as_str().unwrap_or("").to_owned())
+                        } else if i["value"].is_string() {
+                            str_arguments.push(i["value"].as_str().unwrap().to_owned())
+                        }
                     }
+                    version_game_args.extend_from_slice(&get_game_args(str_arguments, &gamedata));
+                } else if let Some(arguments) = p["minecraftArguments"].as_str() {
+                    let oldargs: Vec<String> = arguments
+                        .to_string()
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect();
+                    version_game_args.extend_from_slice(&get_game_args(oldargs, &gamedata))
                 }
-                version_game_args.extend_from_slice(&get_game_args(str_arguments, &gamedata));
-            } else if let Some(arguments) = p["minecraftArguments"].as_str() {
-                let oldargs: Vec<String> = arguments
-                    .to_string()
-                    .split_whitespace()
-                    .map(String::from)
-                    .collect();
-                version_game_args.extend_from_slice(&get_game_args(oldargs, &gamedata))
             }
             let mut wrapper_commands = game_settings.game_wrapper_commands;
             let has_wrapper_commands;
@@ -735,7 +774,27 @@ fn version_json_for_java(p: &Value, mc_dir: &str, game_version: &str) -> Value {
 }
 fn modded_aware_required_major(p: &Value, mc_dir: &str, game_version: &str) -> u64 {
     let v = version_json_for_java(p, mc_dir, game_version);
-    required_java_major(&v, game_version)
+    // For modded ids (e.g. "neoforge-21.1.213") the fallback table must use
+    // the vanilla id, not the loader id.
+    let fallback_id = p["inheritsFrom"].as_str().unwrap_or(game_version);
+    required_java_major(&v, fallback_id)
+}
+/// Plain-string game args from the loader json itself (no placeholders).
+/// NeoForge bootstrap flags live here; fabric profiles have none.
+fn loader_own_game_args(p: &Value) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(list) = p["arguments"]["game"].as_array() {
+        for i in list {
+            if let Some(s) = i.as_str() {
+                args.push(s.to_owned());
+            } else if let Some(s) = i["value"].as_str() {
+                args.push(s.to_owned());
+            }
+        }
+    } else if let Some(old) = p["minecraftArguments"].as_str() {
+        args.extend(old.split_whitespace().map(String::from));
+    }
+    args
 }
 fn automatic_java(p: Value, game_version: &String, ismodded: bool) -> (String, Vec<String>) {
     let mc_dir = get_minecraft_dir();
@@ -758,8 +817,8 @@ fn automatic_java(p: Value, game_version: &String, ismodded: bool) -> (String, V
         managed_java_folder(required),
         binary
     );
-    let modern_args = "-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseNUMA -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=400M -XX:NonNMethodCodeHeapSize=12M -XX:ProfiledCodeHeapSize=194M -XX:NonProfiledCodeHeapSize=194M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -XX:+UseVectorCmov -XX:+PerfDisableSharedMem -XX:+UseFastUnorderedTimeStamps -XX:+UseCriticalJavaThreadPriority -XX:ThreadPriorityPolicy=1 -XX:AllocatePrefetchStyle=3";
-    let java8args = "-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+ParallelRefProcEnabled -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:+AggressiveOpts -XX:MaxInlineLevel=15 -XX:MaxVectorSize=32 -XX:ThreadPriorityPolicy=1 -XX:+UseNUMA -XX:+UseDynamicNumberOfGCThreads -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=350M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -Dgraal.CompilerConfiguration=community";
+    let modern_args = "-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseNUMA -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=400M -XX:NonNMethodCodeHeapSize=12M -XX:ProfiledCodeHeapSize=194M -XX:NonProfiledCodeHeapSize=194M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -XX:+UseVectorCmov -XX:+PerfDisableSharedMem -XX:+UseFastUnorderedTimeStamps -XX:AllocatePrefetchStyle=3";
+    let java8args = "-XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+AlwaysActAsServerClassMachine -XX:+ParallelRefProcEnabled -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:+AggressiveOpts -XX:MaxInlineLevel=15 -XX:MaxVectorSize=32 -XX:+UseNUMA -XX:+UseDynamicNumberOfGCThreads -XX:NmethodSweepActivity=1 -XX:ReservedCodeCacheSize=350M -XX:-DontCompileHugeMethods -XX:MaxNodeLimit=240000 -XX:NodeLimitFudgeFactor=8000 -Dgraal.CompilerConfiguration=community";
     let args = if required == 8 { java8args } else { modern_args };
     (
         path,
@@ -800,27 +859,27 @@ fn lib_manager(p: &Value) -> String {
                 match lib_type {
                     LibraryType::Natives => {
                         let last_piece = lpieces.pop().unwrap();
-                        let libpath = format!(
-                            "{}{}/{}/{}-{}-{}.jar",
-                            lib_dir,
+                        let computed = format!(
+                            "{}/{}/{}-{}-{}.jar",
                             &firstpiece,
                             &lpieces.join("/"),
                             &lpieces[&lpieces.len() - 2],
                             &lpieces[&lpieces.len() - 1],
                             last_piece
                         );
+                        let libpath = artifact_path(library, &lib_dir, &computed);
                         library_list.push_str(&libpath);
                         library_list.push(separator);
                     }
                     LibraryType::Normal => {
-                        let libpath = format!(
-                            "{}{}/{}/{}-{}.jar",
-                            lib_dir,
+                        let computed = format!(
+                            "{}/{}/{}-{}.jar",
                             &firstpiece,
                             &lpieces.join("/"),
                             &lpieces[&lpieces.len() - 2],
                             &lpieces[&lpieces.len() - 1]
                         );
+                        let libpath = artifact_path(library, &lib_dir, &computed);
                         library_list.push_str(&libpath);
                         library_list.push(separator);
                     }
@@ -828,15 +887,15 @@ fn lib_manager(p: &Value) -> String {
                         if libraryname == "tv.twitch:twitch-platform:6.5" {
                             continue;
                         }
-                        let libpath = format!(
-                            "{}{}/{}/{}-{}-natives-{}.jar",
-                            lib_dir,
+                        let computed = format!(
+                            "{}/{}/{}-{}-natives-{}.jar",
                             &firstpiece,
                             &lpieces.join("/"),
                             &lpieces[&lpieces.len() - 2],
                             &lpieces[&lpieces.len() - 1],
                             os
                         );
+                        let libpath = artifact_path(library, &lib_dir, &computed);
                         library_list.push_str(&libpath);
                         library_list.push(separator);
                     }
@@ -852,7 +911,10 @@ fn modded(
     mut gamedata: Vec<String>,
 ) -> (Vec<String>, Vec<String>, String) {
     let mc_dir = get_minecraft_dir();
-    let mut modded_game_args = vec![];
+    // Loader's own game args first (e.g. NeoForge bootstrap flags
+    // --launchTarget/--fml.*; fabric profiles carry none, so this is a no-op
+    // there), vanilla placeholders appended after.
+    let mut modded_game_args = loader_own_game_args(p);
     let vanillaversion = p["inheritsFrom"].as_str().unwrap();
     let vanillajsonpathstring = format!(
         "{}/versions/{}/{}.json",
@@ -873,7 +935,7 @@ fn modded(
                 base_arguments.push(i["value"].as_str().unwrap().to_string())
             }
         }
-        modded_game_args = get_game_args(base_arguments, &gamedata)
+        modded_game_args.extend(get_game_args(base_arguments, &gamedata))
     } else if let Some(arguments) = vjson["minecraftArguments"].as_str() {
         if p["minecraftArguments"].is_null() {
             let oldargs: Vec<String> = arguments

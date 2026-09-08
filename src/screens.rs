@@ -6,7 +6,7 @@ use iced::{
     },
     Alignment, Length,
 };
-use crate::{downloader, theme, widget::Renderer, LauncherState, Message, Screen};
+use crate::{theme, widget::Renderer, LauncherState, Message, Screen};
 pub fn get_screen_content<'a>(
     app: &'a super::DgrLauncher,
 ) -> Column<'a, Message, super::theme::Theme, Renderer> {
@@ -74,7 +74,10 @@ pub fn get_screen_content<'a>(
                             )
                             .placeholder("Select a version")
                             .width(285)
-                            .text_size(15)
+                            .text_size(15),
+                            text(&app.current_version_info)
+                                .size(12)
+                                .style(theme::peach_text)
                         ]
                         .spacing(10)
                     )
@@ -196,73 +199,105 @@ pub fn get_screen_content<'a>(
         .spacing(15)
         .max_width(800),
         Screen::Installation => {
-            let vanilla_pick_list = pick_list(
+            use crate::LoaderChoice;
+            let mc_pick_list = pick_list(
                 app.vanilla_versions_download_list.clone(),
-                Some(app.vanilla_version_to_download.clone()),
+                Some(app.install_mc_version.clone()),
                 Message::VanillaVersionToDownloadChanged,
             )
-            .placeholder("Select a version")
+            .placeholder("Select a Minecraft version")
             .width(250)
             .text_size(15);
-            let fabric_pick_list = pick_list(
-                app.fabric_versions_download_list.clone(),
-                Some(app.fabric_version_to_download.clone()),
-                Message::FabricVersionToDownloadChanged,
-            )
-            .placeholder("Select a version")
-            .width(250)
-            .text_size(15);
-            let vanilla_button_message = match app.vanilla_version_to_download.is_empty() {
-                true => None,
-                false => Some(Message::InstallVersion(downloader::VersionType::Vanilla)),
+            let loader_button = |loader: LoaderChoice| {
+                let (label, selected) = match loader {
+                    LoaderChoice::Vanilla => ("Vanilla", app.install_loader == loader),
+                    LoaderChoice::Fabric => ("Fabric", app.install_loader == loader),
+                    LoaderChoice::NeoForge => ("NeoForge", app.install_loader == loader),
+                };
+                button(text(label).size(14))
+                    .on_press(Message::InstallLoaderChanged(loader))
+                    .style(if selected {
+                        theme::secondary_button
+                    } else {
+                        theme::primary_button
+                    })
+                    .padding(5)
             };
-            let fabric_button_message = match app.fabric_version_to_download.is_empty() {
-                true => None,
-                false => Some(Message::InstallVersion(downloader::VersionType::Fabric)),
-            };
-            let vanilla_install_button = button(
+            let mut loader_column = column![
+                text("Mod loader").size(20),
+                row![
+                    loader_button(LoaderChoice::Vanilla),
+                    loader_button(LoaderChoice::Fabric),
+                    loader_button(LoaderChoice::NeoForge),
+                ]
+                .spacing(10),
+            ]
+            .spacing(10);
+            match app.install_loader {
+                LoaderChoice::Vanilla => {}
+                LoaderChoice::Fabric => {
+                    let fabric_pick_list = pick_list(
+                        app.fabric_loader_list.clone(),
+                        Some(app.fabric_loader_selected.clone()),
+                        Message::FabricLoaderChanged,
+                    )
+                    .placeholder("Select a loader version")
+                    .width(250)
+                    .text_size(15);
+                    loader_column = loader_column.push(fabric_pick_list);
+                }
+                LoaderChoice::NeoForge => {
+                    let neoforge_pick_list = pick_list(
+                        app.neoforge_versions_for_mc.clone(),
+                        Some(app.neoforge_selected.clone()),
+                        Message::NeoForgeVersionChanged,
+                    )
+                    .placeholder("Select a NeoForge version")
+                    .width(250)
+                    .text_size(15);
+                    loader_column = loader_column
+                        .push(neoforge_pick_list)
+                        .push(
+                            row![
+                                text_input(
+                                    "Or enter version manually",
+                                    &app.neoforge_manual
+                                )
+                                .on_input(Message::NeoForgeManualChanged)
+                                .size(14)
+                                .width(200),
+                                button(text("Reload list").size(12))
+                                    .on_press(Message::ReloadNeoForgeList)
+                                    .padding(5),
+                            ]
+                            .spacing(10)
+                            .align_y(Alignment::Center),
+                        )
+                        .push(text(&app.neoforge_status).size(12));
+                }
+            }
+            let install_button = button(
                 text("Install")
                     .size(20)
                     .align_x(alignment::Horizontal::Center),
             )
             .width(250)
             .height(40)
-            .on_press_maybe(vanilla_button_message)
-            .style(theme::secondary_button);
-            let fabric_install_button = button(
-                text("Install")
-                    .size(20)
-                    .align_x(alignment::Horizontal::Center),
-            )
-            .width(250)
-            .height(40)
-            .on_press_maybe(fabric_button_message)
+            .on_press(Message::InstallPressed)
             .style(theme::secondary_button);
             column![
                 text("Version installer").size(50),
-                row![
-                    container(
-                        column![
-                            text("Vanilla"),
-                            vanilla_pick_list,
-                            vanilla_install_button
-                        ]
-                        .spacing(15)
-                    )
-                    .style(theme::black_container)
-                    .padding(10),
-                    container(
-                        column![
-                            text("Fabric"),
-                            fabric_pick_list,
-                            fabric_install_button
-                        ]
-                        .spacing(15)
-                    )
-                    .style(theme::black_container)
-                    .padding(10)
-                ]
-                .spacing(15),
+                container(
+                    column![
+                        text("Minecraft version").size(20),
+                        mc_pick_list,
+                        loader_column,
+                        install_button,
+                    ]
+                    .spacing(15)
+                )
+                .style(theme::black_container)
+                .padding(15),
                 row![
                     toggler(app.show_all_versions_in_download_list).on_toggle(Message::ShowAllVersionsInDownloadListChanged)
                     .width(Length::Shrink),
@@ -327,7 +362,14 @@ pub fn get_screen_content<'a>(
             .max_width(800)
         }
         Screen::Logs => column![
-            text("Game logs").size(25),
+            row![
+                text("Game logs").size(25),
+                button(text("Copy logs").size(12))
+                    .on_press(Message::CopyLogs)
+                    .padding(5),
+            ]
+            .spacing(15)
+            .align_y(Alignment::Center),
             container(
                 scrollable(text(app.logs.join("\n")).size(10))
                     .width(700.0)
