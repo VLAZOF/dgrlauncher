@@ -54,7 +54,6 @@ pub async fn request_code() -> AuthCode {
 pub enum WaitProgress {
     GotAuthToken(AuthToken),
     Waiting,
-    Error(String),
     Finished,
 }
 pub fn start_wait_for_login<I: 'static + Hash + Copy + Send + Sync>(

@@ -3,7 +3,7 @@ use self::widget::Element;
 use iced::{
     alignment, clipboard,
     event::listen_with,
-    widget::{button, column, container, row, svg, tooltip, Button},
+    widget::{button, column, container, row, space, svg, tooltip, Button},
     window::{self},
     Alignment, Length, Subscription, Task,
 };
@@ -23,6 +23,7 @@ use std::{fs::File, sync::Arc};
 use widget::Renderer;
 mod downloader;
 mod launcher;
+mod modrinth;
 mod theme;
 use theme::Theme;
 mod auth;
@@ -58,7 +59,11 @@ fn main() -> iced::Result {
                 width: 900.,
                 height: 535.,
             },
-            resizable: false,
+            min_size: Some(iced::Size {
+                width: 700.,
+                height: 400.,
+            }),
+            resizable: true,
             icon: load_window_icon(),
             exit_on_close_request: false,
             ..window::Settings::default()
@@ -116,7 +121,58 @@ struct DgrLauncher {
     auth_xbox_data: auth::XboxLiveData,
     auth_status: String,
     local_account_to_add_name: String,
-    is_first_launcher_use: bool
+    /// Instance id with an armed delete confirmation (first click done,
+    /// second click deletes). Cleared when the selection changes.
+    delete_confirm: Option<String>,
+    /// Mod store state (slice 1: browse + search + read-only page).
+    modstore_query: String,
+    modstore_results: Vec<modrinth::ModSummary>,
+    modstore_status: String,
+    modstore_detail: Option<modrinth::ModDetail>,
+    modstore_versions: Vec<modrinth::ModVersion>,
+    /// Downloaded icons by URL; `None` = failed, shows cube, no refetch.
+    modstore_icons: HashMap<String, Option<iced::widget::image::Handle>>,
+    /// Store tab (catalog vs installed) and page download flag.
+    modstore_tab: ModStoreTab,
+    modstore_downloading: bool,
+    /// Version row under the cursor (hover reveals its Download button).
+    modstore_hovered_version: Option<String>,
+    /// Hand-dropped jars without a sidecar entry + linking flag.
+    modstore_unlinked: Vec<String>,
+    modstore_linking: bool,
+    /// `project_id -> newest compatible version` newer than installed.
+    modstore_updates: HashMap<String, modrinth::ModVersion>,
+    /// Inline update confirm (`project_id`) in the installed list.
+    modstore_update_confirm: Option<String>,
+    /// Auto/manual update check bookkeeping.
+    modstore_pending_checks: u32,
+    modstore_check_manual: bool,
+    /// Mod page history for Back (dependency hopping).
+    modstore_history: Vec<String>,
+    /// Dependency section state on the mod page.
+    modstore_deps_expanded: bool,
+    modstore_dep_titles: HashMap<String, (String, String)>,
+    /// Installed mods of the current instance (`project_id -> entry`).
+    modstore_installed: HashMap<String, modrinth::InstalledMod>,
+    /// Armed mod delete confirmation (`project_id`), same two-click pattern
+    /// as instance delete.
+    modstore_delete_confirm: Option<String>,
+    /// Saved catalog scroll offset (restored on Back from the mod page).
+    modstore_scroll: f32,
+    /// Live-search debounce generation (stale delayed tasks are ignored).
+    modstore_search_seq: u32,
+    /// Instance settings screen state.
+    instance_name_edit: String,
+    instance_ram_text: String,
+    instance_settings_status: String,
+    /// Loader switch state (fabric loaders or NeoForge versions for the base
+    /// MC, selected/manual input, status). `pending_loader_switch` moves the
+    /// selection to the new NeoForge instance id when it finishes.
+    il_loader_list: Vec<String>,
+    il_selected: String,
+    il_manual: String,
+    il_status: String,
+    pending_loader_switch: Option<String>,
 }
 #[derive(Default, Serialize, Deserialize, Clone)]
 struct Account {
@@ -124,6 +180,70 @@ struct Account {
     username: String,
     refresh_token: String,
 }
+/// Per-instance overrides, stored in
+/// `{instance}/dgrlauncher_instance.json`. `None` = use the global setting.
+#[derive(Default, Serialize, Deserialize, Clone, Debug)]
+struct InstanceConfig {
+    /// "cube" (default) | "star" | "heart" | "letter".
+    icon: Option<String>,
+    /// GiB override, `None` = global `game_ram`.
+    ram: Option<f64>,
+    /// "Automatic" | "System Java" | "Custom", `None` = global.
+    java: Option<String>,
+}
+fn instance_config_path(version: &str) -> String {
+    format!(
+        "{}/dgrlauncher_instance.json",
+        game_instance_dir_for_version(version)
+    )
+}
+fn read_instance_config(version: &str) -> InstanceConfig {
+    std::fs::read_to_string(instance_config_path(version))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+fn write_instance_config(version: &str, cfg: &InstanceConfig) -> Result<(), String> {
+    let dir = game_instance_dir_for_version(version);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Instance folder failed: {e}"))?;
+    let text =
+        serde_json::to_string_pretty(cfg).map_err(|e| format!("Encode failed: {e}"))?;
+    std::fs::write(instance_config_path(version), text)
+        .map_err(|e| format!("Write failed: {e}"))
+}
+/// Base Minecraft version of an installed instance: `inheritsFrom` from
+/// its json, or the id itself for vanilla.
+fn instance_base_mc(version_id: &str) -> String {
+    let json_path = format!(
+        "{}/versions/{}/{}.json",
+        launcher::get_minecraft_dir(),
+        version_id,
+        version_id
+    );
+    std::fs::read_to_string(&json_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .and_then(|v| v["inheritsFrom"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| version_id.to_owned())
+}
+/// Icon preset ids used by the instance settings ("" = default cube).
+fn instance_icon_presets() -> Vec<String> {
+    vec![
+        String::new(),
+        String::from("star"),
+        String::from("heart"),
+        String::from("letter"),
+    ]
+}
+
+/// Mod store tab: catalog from Modrinth vs locally installed mods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModStoreTab {
+    #[default]
+    Store,
+    Installed,
+}
+
 /// Mod loader choice in the version installer. Exactly one can be active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LoaderChoice {
@@ -151,8 +271,9 @@ pub enum Screen {
     Accounts,
     MicrosoftAccount,
     LocalAccount,
-    GettingStarted,
-    GettingStarted2
+    InstanceSettings,
+    ModStore,
+    ModPage,
 }
 #[derive(Debug, Clone)]
 enum Message {
@@ -162,6 +283,7 @@ enum Message {
     ManageGameInfo((usize, launcher::Progress)),
     CurrentAccountChanged(String),
     VersionChanged(String),
+    DeleteInstancePressed(String),
     JavaChanged(String),
     GameRamChanged(f64),
     GameWrapperCommandsChanged(String),
@@ -202,6 +324,44 @@ enum Message {
     LocalAccountNameChanged(String),
     AddedLocalAccount,
     RemoveAccount(String),
+    OpenModStore,
+    ModStoreQueryChanged(String),
+    ModStoreSearch,
+    GotModSearch(Result<Vec<modrinth::ModSummary>, String>),
+    OpenModPage(String),
+    GotModDetail(Result<(modrinth::ModDetail, Vec<modrinth::ModVersion>), String>),
+    ModIconLoaded(String, Option<Vec<u8>>),
+    ModStoreTabChanged(ModStoreTab),
+    ModVersionHovered(String),
+    ModVersionUnhovered(String),
+    ModInstallVersion(String),
+    ModInstallFinished(Result<modrinth::InstalledMod, String>),
+    ModDeletePressed(String),
+    ModStoreScrolled(f32),
+    ModStoreSearchDebounced(u32, String),
+    ModCheckUpdates,
+    ModUpdateChecked(String, Option<modrinth::ModVersion>),
+    ModUpdatePressed(String),
+    ModUpdateApply(String),
+    ModPageBack,
+    ModDepsToggled,
+    GotModDepTitles(HashMap<String, (String, String)>),
+    ModLinkFinished(Result<usize, String>),
+    ModLocalFileDelete(String),
+    OpenInstanceSettings,
+    InstanceNameChanged(String),
+    InstanceRenamePressed,
+    InstanceIconChanged(String),
+    InstanceRamSlider(f64),
+    InstanceRamText(String),
+    InstanceRamReset,
+    InstanceJavaChanged(String),
+    GotInstanceFabricLoaders(Result<Vec<String>, String>),
+    GotInstanceNeoForgeList(Result<Vec<(String, String)>, String>),
+    InstanceLoaderChanged(String),
+    InstanceLoaderManualChanged(String),
+    InstanceLoaderReload,
+    InstanceLoaderApply,
     Exit,
 }
 impl DgrLauncher {
@@ -247,22 +407,47 @@ impl DgrLauncher {
         } else {
             HashMap::new()
         };
-        let java_type = match self.current_java_name.as_str() {
+        // Per-instance overrides (RAM, Java), falling back to globals.
+        let cfg = read_instance_config(&self.current_version);
+        let ram = cfg.ram.unwrap_or(self.game_ram);
+        let eff_java_name = cfg
+            .java
+            .clone()
+            .unwrap_or_else(|| self.current_java_name.clone());
+        let java_type = match eff_java_name.as_str() {
             "System Java" => launcher::JavaType::System,
             "Custom" => launcher::JavaType::Custom,
             _ => launcher::JavaType::Automatic,
         };
+        // Custom binary/flags live globally (Settings > Custom Java).
+        let (jvm_path, jvm_flags) = if eff_java_name == "Custom" {
+            if self.current_java_name == "Custom" {
+                (
+                    self.current_java.path.clone(),
+                    self.current_java.flags.clone(),
+                )
+            } else {
+                let config = getjson(get_config_file_path());
+                (
+                    config["custom_java_path"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned(),
+                    config["custom_java_flags"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned(),
+                )
+            }
+        } else {
+            (String::new(), String::new())
+        };
         let game_settings = launcher::GameSettings {
             account: self.current_account_mc_data.clone(),
             game_version: self.current_version.clone(),
-            jvm: self.current_java.path.clone(),
-            jvmargs: self
-                .current_java
-                .flags
-                .split(' ')
-                .map(|s| s.to_owned())
-                .collect(),
-            ram: self.game_ram,
+            jvm: jvm_path,
+            jvmargs: jvm_flags.split(' ').map(|s| s.to_owned()).collect(),
+            ram,
             game_wrapper_commands: wrapper_commands_vec,
             game_directory: game_instance_dir_for_version(&self.current_version),
             java_type,
@@ -275,7 +460,7 @@ impl DgrLauncher {
 }
 fn boot() -> (DgrLauncher, Task<Message>) {
         backward_compatibility_measures();
-        let is_first_launcher_use = checksettingsfile();
+        checksettingsfile();
         let mut file = File::open(get_config_file_path()).unwrap();
         let mut fcontent = String::new();
         file.read_to_string(&mut fcontent).unwrap();
@@ -352,15 +537,11 @@ fn boot() -> (DgrLauncher, Task<Message>) {
             current_account = accounts.first().cloned().unwrap_or_default();
             persist_current_account(&current_account);
         }
-        let initial_screen = match is_first_launcher_use{
-            true => Screen::GettingStarted,
-            false => Screen::Main,
-        };
         let current_version = p["current_version"].as_str().unwrap().to_owned();
         let current_version_info = describe_version(&current_version);
         (
             DgrLauncher {
-                screen: initial_screen,
+                screen: Screen::Main,
                 current_account: current_account,
                 current_version,
                 current_version_info,
@@ -378,7 +559,6 @@ fn boot() -> (DgrLauncher, Task<Message>) {
                 custom_java_flags: p["custom_java_flags"].as_str().unwrap_or("").to_owned(),
                 needs_to_update_download_list: true,
                 accounts,
-                is_first_launcher_use,
                 ..Default::default()
             },
             Task::batch(vec![
@@ -395,14 +575,82 @@ impl DgrLauncher {
         format!("DgrLauncher {}", env!("CARGO_PKG_VERSION"))
     }
 }
+    /// Reusable Modrinth page fetch: project + its versions.
+    fn fetch_mod_page(id: String) -> Task<Message> {
+        Task::perform(
+            async move {
+                let detail = modrinth::get_project(&id).await?;
+                let versions = modrinth::get_versions(&detail.id).await?;
+                Ok((detail, versions))
+            },
+            Message::GotModDetail,
+        )
+    }
+    /// One update check per installed mod: the newest compatible version
+    /// when it differs from the installed one. Fetch errors simply report
+    /// "no update", never failing the batch.
+    fn spawn_update_checks(
+        installed: &HashMap<String, modrinth::InstalledMod>,
+        loader: String,
+        mc: String,
+    ) -> Vec<Task<Message>> {
+        let mut tasks = Vec::new();
+        for e in installed.values() {
+            let pid = e.project_id.clone();
+            let installed_id = e.version_id.clone();
+            let loader = loader.clone();
+            let mc = mc.clone();
+            tasks.push(Task::perform(
+                async move {
+                    let latest = modrinth::get_versions(&pid)
+                        .await
+                        .ok()
+                        .and_then(|vs| {
+                            modrinth::latest_compatible(&vs, &loader, &mc).cloned()
+                        })
+                        .filter(|v| v.id != installed_id);
+                    (pid, latest)
+                },
+                |(pid, latest)| Message::ModUpdateChecked(pid, latest),
+            ));
+        }
+        tasks
+    }
+    /// Scroll the catalog back to the saved offset.
+    fn restore_store_scroll(y: f32) -> Task<Message> {
+        iced_runtime::task::widget(
+            iced_core::widget::operation::scrollable::scroll_to(
+                iced::widget::Id::new("modstore-list"),
+                iced_core::widget::operation::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(y),
+                },
+            ),
+        )
+    }
     fn update(state: &mut DgrLauncher, message: Message) -> Task<Message> {
         match message {
             Message::Launch => {
-                if state.current_java_name == "Custom" && state.current_java.path.trim().is_empty()
-                {
-                    state.game_state_text =
-                        String::from("Set a custom Java path first (Settings > Custom Java).");
-                    return Task::none();
+                // Effective Java (per-instance override or global): a Custom
+                // pick without a binary path cannot launch.
+                let eff_java = read_instance_config(&state.current_version)
+                    .java
+                    .unwrap_or_else(|| state.current_java_name.clone());
+                if eff_java == "Custom" {
+                    let path = if state.current_java_name == "Custom" {
+                        state.current_java.path.clone()
+                    } else {
+                        getjson(get_config_file_path())["custom_java_path"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_owned()
+                    };
+                    if path.trim().is_empty() {
+                        state.game_state_text = String::from(
+                            "Set a custom Java path first (Settings > Custom Java).",
+                        );
+                        return Task::none();
+                    }
                 }
                 if !state.restrict_launch
                     && !state.current_account.username.is_empty()
@@ -512,8 +760,867 @@ impl DgrLauncher {
             Message::VersionChanged(new_version) => {
                 state.current_version_info = describe_version(&new_version);
                 state.current_version = new_version;
+                // Selecting another instance disarms delete confirmation.
+                state.delete_confirm = None;
                 Task::none()
             }
+            Message::DeleteInstancePressed(id) => {
+                if state.delete_confirm.as_deref() == Some(&id) {
+                    // Second click: confirmed, delete version + instance dirs.
+                    if !id.is_empty()
+                        && !id.contains("..")
+                        && !id.contains('/')
+                        && !id.contains('\\')
+                    {
+                        let version_dir = format!(
+                            "{}/versions/{}",
+                            launcher::get_minecraft_dir(),
+                            id
+                        );
+                        if let Err(e) = fs::remove_dir_all(&version_dir) {
+                            println!("Failed to delete version dir: {e}");
+                        }
+                        let instance_dir = game_instance_dir_for_version(&id);
+                        if let Err(e) = fs::remove_dir_all(&instance_dir) {
+                            println!("Failed to delete instance dir: {e}");
+                        }
+                    }
+                    state.delete_confirm = None;
+                    if state.current_version == id {
+                        state.current_version = String::new();
+                        state.current_version_info = String::new();
+                    }
+                    return Task::perform(
+                        launcher::getinstalledversions(),
+                        Message::LoadVersionList,
+                    );
+                }
+                // First click: arm confirmation, second click deletes.
+                state.delete_confirm = Some(id);
+                Task::none()
+            }
+            Message::OpenModStore => {
+                // Store is only for modded instances (vanilla button disabled).
+                if state.current_version.is_empty()
+                    || modrinth::instance_loader(&state.current_version).is_none()
+                {
+                    return Task::none();
+                }
+                state.screen = Screen::ModStore;
+                state.modstore_query = String::new();
+                state.modstore_results = Vec::new();
+                state.modstore_detail = None;
+                state.modstore_versions = Vec::new();
+                state.modstore_tab = ModStoreTab::Store;
+                state.modstore_downloading = false;
+                state.modstore_delete_confirm = None;
+                state.modstore_hovered_version = None;
+                state.modstore_updates = HashMap::new();
+                state.modstore_update_confirm = None;
+                state.modstore_pending_checks = 0;
+                state.modstore_check_manual = false;
+                state.modstore_history = Vec::new();
+                state.modstore_deps_expanded = false;
+                state.modstore_unlinked = Vec::new();
+                state.modstore_linking = false;
+                state.modstore_scroll = 0.0;
+                state.modstore_installed =
+                    modrinth::installed_mods(&state.current_version);
+                state.modstore_status = String::from("Loading popular mods...");
+                // Auto update check for installed mods (manual button too).
+                let (mc, loader) = modrinth::instance_loader(&state.current_version)
+                    .unwrap_or_default();
+                let mut tasks = vec![Task::perform(
+                    modrinth::search_mods(""),
+                    Message::GotModSearch,
+                )];
+                let checks =
+                    spawn_update_checks(&state.modstore_installed, loader, mc);
+                state.modstore_pending_checks = checks.len() as u32;
+                tasks.extend(checks);
+                return Task::batch(tasks);
+            }
+            Message::ModStoreQueryChanged(q) => {
+                state.modstore_query = q.clone();
+                state.modstore_search_seq = state.modstore_search_seq.wrapping_add(1);
+                // Installed tab filters locally as you type; the catalog
+                // searches live with a debounce (Enter still works instantly).
+                if state.modstore_tab != ModStoreTab::Store {
+                    return Task::none();
+                }
+                let seq = state.modstore_search_seq;
+                return Task::perform(
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+                        (seq, q)
+                    },
+                    |(seq, query)| Message::ModStoreSearchDebounced(seq, query),
+                );
+            }
+            Message::ModStoreSearchDebounced(seq, query) => {
+                // Stale delayed task (user kept typing) or left the tab.
+                if seq != state.modstore_search_seq
+                    || state.modstore_tab != ModStoreTab::Store
+                    || query != state.modstore_query
+                {
+                    return Task::none();
+                }
+                state.modstore_results = Vec::new();
+                state.modstore_status = String::from("Searching...");
+                return Task::perform(
+                    async move { modrinth::search_mods(&query).await },
+                    Message::GotModSearch,
+                );
+            }
+            Message::ModStoreSearch => {
+                // API search always targets the catalog tab (installed
+                // filters locally as you type, no request needed).
+                state.modstore_tab = ModStoreTab::Store;
+                // Invalidate pending debounced tasks.
+                state.modstore_search_seq = state.modstore_search_seq.wrapping_add(1);
+                let query = state.modstore_query.clone();
+                state.modstore_results = Vec::new();
+                state.modstore_status = String::from("Searching...");
+                return Task::perform(
+                    async move { modrinth::search_mods(&query).await },
+                    Message::GotModSearch,
+                );
+            }
+            Message::GotModSearch(result) => {
+                match result {
+                    Ok(list) => {
+                        if list.is_empty() {
+                            state.modstore_status =
+                                String::from("Nothing found. Try another query.");
+                        } else {
+                            state.modstore_status = String::new();
+                        }
+                        state.modstore_results = list;
+                    }
+                    Err(err) => {
+                        state.modstore_results = Vec::new();
+                        state.modstore_status = err;
+                    }
+                }
+                // Fetch missing icons in the background (cube fallback meanwhile).
+                let mut tasks = Vec::new();
+                for m in &state.modstore_results {
+                    if m.icon_url.is_empty() || state.modstore_icons.contains_key(&m.icon_url)
+                    {
+                        continue;
+                    }
+                    let url = m.icon_url.clone();
+                    let url2 = url.clone();
+                    tasks.push(Task::perform(
+                        async move { modrinth::fetch_icon(&url2).await },
+                        move |bytes| Message::ModIconLoaded(url, bytes),
+                    ));
+                }
+                Task::batch(tasks)
+            }
+            Message::OpenModPage(id) => {
+                // Remember the return page when hopping through dependencies.
+                if state.screen == Screen::ModPage {
+                    if let Some(d) = &state.modstore_detail {
+                        let back_to = d.id.clone();
+                        if state.modstore_history.last() != Some(&back_to) {
+                            state.modstore_history.push(back_to);
+                            if state.modstore_history.len() > 20 {
+                                state.modstore_history.remove(0);
+                            }
+                        }
+                    }
+                }
+                state.screen = Screen::ModPage;
+                state.modstore_detail = None;
+                state.modstore_versions = Vec::new();
+                state.modstore_downloading = false;
+                state.modstore_delete_confirm = None;
+                state.modstore_hovered_version = None;
+                state.modstore_deps_expanded = false;
+                state.modstore_status = String::from("Loading mod page...");
+                return fetch_mod_page(id);
+            }
+            Message::GotModDetail(result) => {
+                match result {
+                    Ok((detail, versions)) => {
+                        state.modstore_status = String::new();
+                        state.modstore_detail = Some(detail.clone());
+                        state.modstore_versions = versions;
+                        let mut tasks = Vec::new();
+                        if !detail.icon_url.is_empty()
+                            && !state.modstore_icons.contains_key(&detail.icon_url)
+                        {
+                            let url = detail.icon_url.clone();
+                            let url2 = url.clone();
+                            tasks.push(Task::perform(
+                                async move { modrinth::fetch_icon(&url2).await },
+                                move |bytes| Message::ModIconLoaded(url, bytes),
+                            ));
+                        }
+                        // Resolve dependency titles for the newest compatible
+                        // version (cached across pages).
+                        let (mc, loader) = modrinth::instance_loader(&state.current_version)
+                            .unwrap_or_default();
+                        if let Some(latest) = modrinth::latest_compatible(
+                            &state.modstore_versions,
+                            &loader,
+                            &mc,
+                        ) {
+                            let mut seen = std::collections::HashSet::new();
+                            let missing: Vec<String> = latest
+                                .dependencies
+                                .iter()
+                                .filter_map(|d| d.project_id.clone())
+                                .filter(|pid| {
+                                    !state.modstore_dep_titles.contains_key(pid)
+                                        && seen.insert(pid.clone())
+                                })
+                                .collect();
+                            if !missing.is_empty() {
+                                tasks.push(Task::perform(
+                                    async move {
+                                        modrinth::get_project_titles(&missing).await
+                                    },
+                                    Message::GotModDepTitles,
+                                ));
+                            }
+                        }
+                        return Task::batch(tasks);
+                    }
+                    Err(err) => {
+                        state.modstore_status = err;
+                    }
+                }
+                Task::none()
+            }
+            Message::ModIconLoaded(url, bytes) => {
+                let handle = bytes.map(iced::widget::image::Handle::from_bytes);
+                state.modstore_icons.insert(url, handle);
+                Task::none()
+            }
+            Message::ModStoreTabChanged(tab) => {
+                state.modstore_tab = tab;
+                state.modstore_delete_confirm = None;
+                if tab == ModStoreTab::Installed {
+                    state.modstore_installed =
+                        modrinth::installed_mods(&state.current_version);
+                    state.modstore_unlinked =
+                        modrinth::unlinked_mod_files(&state.current_version);
+                    let mut tasks = Vec::new();
+                    // Identify hand-dropped jars by hash (auto-link).
+                    if !state.modstore_unlinked.is_empty() && !state.modstore_linking
+                    {
+                        state.modstore_linking = true;
+                        state.modstore_status =
+                            String::from("Identifying hand-added files...");
+                        let instance = state.current_version.clone();
+                        tasks.push(Task::perform(
+                            async move { modrinth::link_unlinked_mods(&instance).await },
+                            Message::ModLinkFinished,
+                        ));
+                    }
+                    // Fetch missing icons for installed rows (cube meanwhile).
+                    for e in state.modstore_installed.values() {
+                        if e.icon_url.is_empty()
+                            || state.modstore_icons.contains_key(&e.icon_url)
+                        {
+                            continue;
+                        }
+                        let url = e.icon_url.clone();
+                        let url2 = url.clone();
+                        tasks.push(Task::perform(
+                            async move { modrinth::fetch_icon(&url2).await },
+                            move |bytes| Message::ModIconLoaded(url, bytes),
+                        ));
+                    }
+                    return Task::batch(tasks);
+                }
+                Task::none()
+            }
+            Message::ModLinkFinished(result) => {
+                state.modstore_linking = false;
+                match result {
+                    Ok(n) => {
+                        state.modstore_installed =
+                            modrinth::installed_mods(&state.current_version);
+                        state.modstore_unlinked =
+                            modrinth::unlinked_mod_files(&state.current_version);
+                        if n > 0 {
+                            state.modstore_status = format!(
+                                "Linked {n} hand-added mod(s) ✓"
+                            );
+                        } else if state.modstore_status
+                            == "Identifying hand-added files..."
+                        {
+                            state.modstore_status = String::new();
+                        }
+                    }
+                    Err(err) => {
+                        state.modstore_status = err;
+                    }
+                }
+                Task::none()
+            }
+            Message::ModLocalFileDelete(name) => {
+                let key = format!("file:{name}");
+                if state.modstore_delete_confirm.as_deref() == Some(&key) {
+                    // Second click: delete the jar itself.
+                    let safe_ok = !name.contains('/')
+                        && !name.contains('\\')
+                        && name.ends_with(".jar");
+                    if safe_ok {
+                        let path = format!(
+                            "{}/{}",
+                            modrinth::mods_dir(&state.current_version),
+                            name
+                        );
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            state.modstore_status = format!("Delete failed: {e}");
+                        } else {
+                            state.modstore_status = String::from("File deleted.");
+                        }
+                    }
+                    state.modstore_delete_confirm = None;
+                    state.modstore_unlinked =
+                        modrinth::unlinked_mod_files(&state.current_version);
+                    return Task::none();
+                }
+                state.modstore_delete_confirm = Some(key);
+                Task::none()
+            }
+            Message::ModVersionHovered(id) => {
+                state.modstore_hovered_version = Some(id);
+                Task::none()
+            }
+            Message::ModVersionUnhovered(id) => {
+                if state.modstore_hovered_version.as_deref() == Some(&id) {
+                    state.modstore_hovered_version = None;
+                }
+                Task::none()
+            }
+            Message::ModInstallVersion(version_id) => {
+                let detail = match &state.modstore_detail {
+                    Some(d) => d.clone(),
+                    None => return Task::none(),
+                };
+                let version = match state
+                    .modstore_versions
+                    .iter()
+                    .find(|v| v.id == version_id)
+                {
+                    Some(v) => v.clone(),
+                    None => return Task::none(),
+                };
+                if state.modstore_downloading || state.current_version.is_empty() {
+                    return Task::none();
+                }
+                let instance = state.current_version.clone();
+                state.modstore_downloading = true;
+                state.modstore_status = format!("Downloading {}...", version.filename);
+                return Task::perform(
+                    async move { modrinth::install_mod(&instance, &detail, &version).await },
+                    Message::ModInstallFinished,
+                );
+            }
+            Message::ModInstallFinished(result) => {
+                state.modstore_downloading = false;
+                match result {
+                    Ok(entry) => {
+                        state.modstore_status =
+                            format!("Installed {} ✓", entry.version_number);
+                        state.modstore_installed =
+                            modrinth::installed_mods(&state.current_version);
+                        if state.modstore_update_confirm.as_deref()
+                            == Some(&entry.project_id)
+                        {
+                            state.modstore_update_confirm = None;
+                        }
+                        // Refresh the update entry from the loaded page list
+                        // when available; otherwise drop it (rechecked later).
+                        if state.modstore_versions.is_empty() {
+                            state.modstore_updates.remove(&entry.project_id);
+                        } else {
+                            let (mc, loader) =
+                                modrinth::instance_loader(&state.current_version)
+                                    .unwrap_or_default();
+                            match modrinth::latest_compatible(
+                                &state.modstore_versions,
+                                &loader,
+                                &mc,
+                            ) {
+                                Some(latest) if latest.id != entry.version_id => {
+                                    state.modstore_updates.insert(
+                                        entry.project_id.clone(),
+                                        latest.clone(),
+                                    );
+                                }
+                                _ => {
+                                    state.modstore_updates.remove(&entry.project_id);
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        state.modstore_status = err;
+                    }
+                }
+                Task::none()
+            }
+            Message::ModDeletePressed(project_id) => {
+                if state.modstore_delete_confirm.as_deref() == Some(&project_id) {
+                    // Second click: confirmed.
+                    if let Err(e) =
+                        modrinth::delete_mod(&state.current_version, &project_id)
+                    {
+                        state.modstore_status = e;
+                    } else {
+                        state.modstore_status = String::from("Mod deleted.");
+                    }
+                    state.modstore_delete_confirm = None;
+                    state.modstore_updates.remove(&project_id);
+                    if state.modstore_update_confirm.as_deref() == Some(&project_id) {
+                        state.modstore_update_confirm = None;
+                    }
+                    state.modstore_installed =
+                        modrinth::installed_mods(&state.current_version);
+                    return Task::none();
+                }
+                // First click: arm confirmation.
+                state.modstore_delete_confirm = Some(project_id);
+                Task::none()
+            }
+            Message::ModStoreScrolled(y) => {
+                state.modstore_scroll = y;
+                Task::none()
+            }
+            Message::ModCheckUpdates => {
+                if state.current_version.is_empty() {
+                    return Task::none();
+                }
+                state.modstore_installed =
+                    modrinth::installed_mods(&state.current_version);
+                let (mc, loader) = modrinth::instance_loader(&state.current_version)
+                    .unwrap_or_default();
+                let checks =
+                    spawn_update_checks(&state.modstore_installed, loader, mc);
+                state.modstore_pending_checks = checks.len() as u32;
+                if checks.is_empty() {
+                    state.modstore_check_manual = false;
+                    state.modstore_status = if state.modstore_installed.is_empty() {
+                        String::from("No mods installed.")
+                    } else {
+                        String::from("All mods up to date ✓")
+                    };
+                    return Task::none();
+                }
+                state.modstore_check_manual = true;
+                state.modstore_status = String::from("Checking updates...");
+                return Task::batch(checks);
+            }
+            Message::ModUpdateChecked(pid, latest) => {
+                match latest {
+                    Some(v) => {
+                        state.modstore_updates.insert(pid, v);
+                    }
+                    None => {
+                        state.modstore_updates.remove(&pid);
+                    }
+                }
+                state.modstore_pending_checks =
+                    state.modstore_pending_checks.saturating_sub(1);
+                if state.modstore_pending_checks == 0 && state.modstore_check_manual {
+                    state.modstore_check_manual = false;
+                    state.modstore_status = if state.modstore_updates.is_empty() {
+                        String::from("All mods up to date ✓")
+                    } else {
+                        format!("{} update(s) available", state.modstore_updates.len())
+                    };
+                }
+                Task::none()
+            }
+            Message::ModUpdatePressed(pid) => {
+                // Toggle the inline confirm, but only when update data exists
+                // (otherwise there is nothing to confirm).
+                if state.modstore_update_confirm.as_deref() == Some(&pid) {
+                    state.modstore_update_confirm = None;
+                } else if state.modstore_updates.contains_key(&pid) {
+                    state.modstore_update_confirm = Some(pid);
+                }
+                Task::none()
+            }
+            Message::ModUpdateApply(pid) => {
+                let version = match state.modstore_updates.get(&pid) {
+                    Some(v) => v.clone(),
+                    None => return Task::none(),
+                };
+                let entry = match state.modstore_installed.get(&pid) {
+                    Some(e) => e.clone(),
+                    None => return Task::none(),
+                };
+                if state.current_version.is_empty() {
+                    return Task::none();
+                }
+                let detail = modrinth::ModDetail {
+                    id: entry.project_id.clone(),
+                    slug: entry.slug.clone(),
+                    title: entry.title.clone(),
+                    description: String::new(),
+                    icon_url: entry.icon_url.clone(),
+                    downloads: 0,
+                };
+                let instance = state.current_version.clone();
+                state.modstore_downloading = true;
+                state.modstore_update_confirm = None;
+                state.modstore_status = format!("Updating {}...", entry.title);
+                return Task::perform(
+                    async move { modrinth::install_mod(&instance, &detail, &version).await },
+                    Message::ModInstallFinished,
+                );
+            }
+            Message::ModPageBack => {
+                if let Some(prev) = state.modstore_history.pop() {
+                    // Back through dependency pages without pushing again.
+                    state.screen = Screen::ModPage;
+                    state.modstore_detail = None;
+                    state.modstore_versions = Vec::new();
+                    state.modstore_downloading = false;
+                    state.modstore_delete_confirm = None;
+                    state.modstore_hovered_version = None;
+                    state.modstore_deps_expanded = false;
+                    state.modstore_status = String::from("Loading mod page...");
+                    return fetch_mod_page(prev);
+                }
+                state.screen = Screen::ModStore;
+                state.modstore_installed =
+                    modrinth::installed_mods(&state.current_version);
+                let y = state.modstore_scroll;
+                return restore_store_scroll(y);
+            }
+            Message::ModDepsToggled => {
+                state.modstore_deps_expanded = !state.modstore_deps_expanded;
+                Task::none()
+            }
+            Message::GotModDepTitles(map) => {
+                state.modstore_dep_titles.extend(map);
+                Task::none()
+            }
+            Message::OpenInstanceSettings => {
+                if state.current_version.is_empty() {
+                    return Task::none();
+                }
+                state.screen = Screen::InstanceSettings;
+                state.instance_name_edit = state.current_version.clone();
+                let cfg = read_instance_config(&state.current_version);
+                state.instance_ram_text =
+                    format!("{:.2}", cfg.ram.unwrap_or(state.game_ram));
+                state.instance_settings_status = String::new();
+                state.il_status = String::new();
+                state.il_manual = String::new();
+                state.il_loader_list = Vec::new();
+                state.il_selected = String::new();
+                // Prefill loader switch data for modded instances.
+                if state.current_version.ends_with("-fabric") {
+                    let base = state
+                        .current_version
+                        .trim_end_matches("-fabric")
+                        .to_owned();
+                    return Task::perform(
+                        async move {
+                            downloader::get_fabric_loader_versions(&base).await
+                        },
+                        Message::GotInstanceFabricLoaders,
+                    );
+                }
+                if state.current_version.starts_with("neoforge-") {
+                    if state.neoforge_all.is_empty() {
+                        return Task::perform(
+                            downloader::get_neoforge_versions(),
+                            Message::GotInstanceNeoForgeList,
+                        );
+                    }
+                    let mc = instance_base_mc(&state.current_version);
+                    state.il_loader_list = state
+                        .neoforge_all
+                        .iter()
+                        .filter(|(m, _)| *m == mc)
+                        .map(|(_, nf)| nf.clone())
+                        .collect();
+                    state.il_selected =
+                        state.il_loader_list.first().cloned().unwrap_or_default();
+                }
+                Task::none()
+            }
+            Message::InstanceNameChanged(name) => {
+                state.instance_name_edit = name;
+                Task::none()
+            }
+            Message::InstanceRenamePressed => {
+                let old = state.current_version.clone();
+                let new = state.instance_name_edit.trim().to_owned();
+                let mc_dir = launcher::get_minecraft_dir();
+                if new.is_empty()
+                    || new == "."
+                    || new == ".."
+                    || new.contains('/')
+                    || new.contains('\\')
+                {
+                    state.instance_settings_status = String::from("Invalid name.");
+                    return Task::none();
+                }
+                if new == old {
+                    state.instance_settings_status =
+                        String::from("Same name, nothing to do.");
+                    return Task::none();
+                }
+                if Path::new(&format!("{mc_dir}/versions/{new}")).exists() {
+                    state.instance_settings_status =
+                        String::from("A version with this name already exists.");
+                    return Task::none();
+                }
+                // 1. Version dir (authoritative for launch).
+                if let Err(e) = fs::rename(
+                    format!("{mc_dir}/versions/{old}"),
+                    format!("{mc_dir}/versions/{new}"),
+                ) {
+                    state.instance_settings_status = format!("Rename failed: {e}");
+                    return Task::none();
+                }
+                // 2. Inner files follow the folder name; patch "id" to match.
+                for ext in ["json", "jar"] {
+                    let from = format!("{mc_dir}/versions/{new}/{old}.{ext}");
+                    if Path::new(&from).exists() {
+                        if let Err(e) = fs::rename(
+                            &from,
+                            format!("{mc_dir}/versions/{new}/{new}.{ext}"),
+                        ) {
+                            state.instance_settings_status =
+                                format!("Rename failed: {e}");
+                            return Task::none();
+                        }
+                    }
+                }
+                let new_json = format!("{mc_dir}/versions/{new}/{new}.json");
+                if let Ok(content) = fs::read_to_string(&new_json) {
+                    if let Ok(mut v) = serde_json::from_str::<Value>(&content) {
+                        if v["id"].as_str() == Some(old.as_str()) {
+                            v["id"] = Value::String(new.clone());
+                            if let Ok(text) = serde_json::to_string_pretty(&v) {
+                                let _ = fs::write(&new_json, text);
+                            }
+                        }
+                    }
+                }
+                // 3. Instance data dir (saves, mods, configs move along).
+                let old_inst = game_instance_dir_for_version(&old);
+                if Path::new(&old_inst).exists() {
+                    if let Err(e) =
+                        fs::rename(&old_inst, game_instance_dir_for_version(&new))
+                    {
+                        state.instance_settings_status = format!(
+                            "Version renamed, but instance folder failed: {e}"
+                        );
+                    }
+                }
+                state.current_version = new.clone();
+                state.current_version_info = describe_version(&new);
+                state.delete_confirm = None;
+                state.instance_name_edit = new.clone();
+                if !state
+                    .instance_settings_status
+                    .starts_with("Version renamed")
+                {
+                    state.instance_settings_status = String::from("Renamed ✓");
+                }
+                return Task::perform(
+                    launcher::getinstalledversions(),
+                    Message::LoadVersionList,
+                );
+            }
+            Message::InstanceIconChanged(preset) => {
+                let mut cfg = read_instance_config(&state.current_version);
+                cfg.icon = if preset.is_empty() {
+                    None
+                } else {
+                    Some(preset)
+                };
+                if let Err(e) = write_instance_config(&state.current_version, &cfg) {
+                    state.instance_settings_status = e;
+                }
+                Task::none()
+            }
+            Message::InstanceRamSlider(ram) => {
+                let mut cfg = read_instance_config(&state.current_version);
+                cfg.ram = Some(ram);
+                if let Err(e) = write_instance_config(&state.current_version, &cfg) {
+                    state.instance_settings_status = e;
+                } else {
+                    state.instance_settings_status = String::new();
+                }
+                state.instance_ram_text = format!("{ram:.2}");
+                Task::none()
+            }
+            Message::InstanceRamText(s) => {
+                state.instance_ram_text = s.clone();
+                let normalized = s.replace(',', ".");
+                match normalized.trim().parse::<f64>() {
+                    Ok(v) if (0.5..=32.0).contains(&v) => {
+                        let mut cfg = read_instance_config(&state.current_version);
+                        cfg.ram = Some(v);
+                        if let Err(e) =
+                            write_instance_config(&state.current_version, &cfg)
+                        {
+                            state.instance_settings_status = e;
+                        } else {
+                            state.instance_settings_status = String::new();
+                        }
+                    }
+                    _ => {
+                        state.instance_settings_status =
+                            String::from("Enter 0.5 – 32 (GiB).");
+                    }
+                }
+                Task::none()
+            }
+            Message::InstanceRamReset => {
+                let mut cfg = read_instance_config(&state.current_version);
+                cfg.ram = None;
+                if let Err(e) = write_instance_config(&state.current_version, &cfg) {
+                    state.instance_settings_status = e;
+                } else {
+                    state.instance_settings_status = String::new();
+                }
+                state.instance_ram_text = format!("{:.2}", state.game_ram);
+                Task::none()
+            }
+            Message::InstanceJavaChanged(name) => {
+                let mut cfg = read_instance_config(&state.current_version);
+                cfg.java = if name == "Global" {
+                    None
+                } else {
+                    Some(name)
+                };
+                if let Err(e) = write_instance_config(&state.current_version, &cfg) {
+                    state.instance_settings_status = e;
+                }
+                Task::none()
+            }
+            Message::GotInstanceFabricLoaders(result) => {
+                match result {
+                    Ok(list) => {
+                        state.il_loader_list = list.clone();
+                        state.il_selected = list.first().cloned().unwrap_or_default();
+                        state.il_status = String::new();
+                    }
+                    Err(err) => state.il_status = err,
+                }
+                Task::none()
+            }
+            Message::GotInstanceNeoForgeList(result) => {
+                match result {
+                    Ok(pairs) => {
+                        // Shared cache, the installer screen benefits too.
+                        state.neoforge_all = pairs;
+                        let mc = instance_base_mc(&state.current_version);
+                        state.il_loader_list = state
+                            .neoforge_all
+                            .iter()
+                            .filter(|(m, _)| *m == mc)
+                            .map(|(_, nf)| nf.clone())
+                            .collect();
+                        state.il_selected = state
+                            .il_loader_list
+                            .first()
+                            .cloned()
+                            .unwrap_or_default();
+                        state.il_status = String::new();
+                    }
+                    Err(err) => state.il_status = err,
+                }
+                Task::none()
+            }
+            Message::InstanceLoaderChanged(loader) => {
+                state.il_selected = loader;
+                state.il_manual = String::new();
+                Task::none()
+            }
+            Message::InstanceLoaderManualChanged(version) => {
+                state.il_manual = version;
+                Task::none()
+            }
+            Message::InstanceLoaderReload => {
+                state.il_status = String::from("Loading loader versions...");
+                state.il_loader_list = Vec::new();
+                state.il_selected = String::new();
+                if state.current_version.ends_with("-fabric") {
+                    let base = state
+                        .current_version
+                        .trim_end_matches("-fabric")
+                        .to_owned();
+                    return Task::perform(
+                        async move {
+                            downloader::get_fabric_loader_versions(&base).await
+                        },
+                        Message::GotInstanceFabricLoaders,
+                    );
+                }
+                return Task::perform(
+                    downloader::get_neoforge_versions(),
+                    Message::GotInstanceNeoForgeList,
+                );
+            }
+            Message::InstanceLoaderApply => {
+                if state.current_version.ends_with("-fabric") {
+                    if state.il_selected.is_empty() {
+                        state.il_status =
+                            String::from("Select a Fabric loader version first.");
+                        return Task::none();
+                    }
+                    let base = state
+                        .current_version
+                        .trim_end_matches("-fabric")
+                        .to_owned();
+                    let loader = state.il_selected.clone();
+                    state.il_status = format!(
+                        "Downloading Fabric {loader}... (progress on Installation screen)"
+                    );
+                    state.downloaders.push(Downloader::new(state.downloaders.len()));
+                    let index = state.downloaders.len() - 1;
+                    state.downloaders[index].start(
+                        base,
+                        downloader::VersionType::Fabric { loader },
+                    );
+                    return Task::none();
+                }
+                if state.current_version.starts_with("neoforge-") {
+                    let nf = if !state.il_manual.trim().is_empty() {
+                        state.il_manual.trim().to_owned()
+                    } else {
+                        state.il_selected.clone()
+                    };
+                    if nf.is_empty() {
+                        state.il_status = String::from(
+                            "Select a NeoForge version or enter it manually.",
+                        );
+                        return Task::none();
+                    }
+                    let mc = instance_base_mc(&state.current_version);
+                    state.pending_neoforge_install = Some((mc.clone(), nf.clone()));
+                    // Same installer flow as the Installation screen; when it
+                    // finishes, the selection moves to the new instance.
+                    state.pending_loader_switch = Some(format!("neoforge-{nf}"));
+                    state.il_status =
+                        String::from("Downloading Minecraft files first...");
+                    state.downloaders.push(Downloader::new(state.downloaders.len()));
+                    let index = state.downloaders.len() - 1;
+                    state.downloaders[index]
+                        .start(mc, downloader::VersionType::Vanilla);
+                    return Task::none();
+                }
+                state.il_status = String::from("No loader to switch on vanilla.");
+                Task::none()
+            }
+
             Message::ChangeScreen(new_screen) => {
                 if state.screen == Screen::Settings {
                     updatesettingsfile(
@@ -528,7 +1635,6 @@ impl DgrLauncher {
                 state.screen = new_screen.clone();
                 match new_screen {
                     Screen::Main => {
-                        state.is_first_launcher_use = false;
                         Task::perform(launcher::getinstalledversions(), Message::LoadVersionList)
                     }
                     Screen::Installation => {
@@ -782,6 +1888,8 @@ impl DgrLauncher {
                 Task::none()
             }
             Message::InstallPressed => {
+                // A manual install cancels a pending loader switch target.
+                state.pending_loader_switch = None;
                 if state.install_mc_version.is_empty() {
                     state.download_text = String::from("Select a Minecraft version first.");
                     return Task::none();
@@ -877,11 +1985,6 @@ impl DgrLauncher {
                                 state.downloaders[index].start_neoforge(mc, nf);
                             }
                         }
-                        if state.is_first_launcher_use{
-                            state.is_first_launcher_use = false;
-                            state.screen = Screen::Main;
-                            return Task::perform(launcher::getinstalledversions(), Message::LoadVersionList)
-                        }
                     }
                     downloader::Progress::Errored(error) => {
                         state.download_text = format!("Failed to install: {error}");
@@ -952,6 +2055,15 @@ impl DgrLauncher {
                     downloader::Progress::NeoForgeFinished => {
                         state.restrict_launch = false;
                         state.pending_neoforge_install = None;
+                        // Loader switch from instance settings: move the
+                        // selection to the freshly installed instance.
+                        if let Some(new_id) = state.pending_loader_switch.take() {
+                            state.current_version = new_id.clone();
+                            state.current_version_info = describe_version(&new_id);
+                            state.delete_confirm = None;
+                            state.il_status =
+                                format!("Switched to {new_id}.");
+                        }
                         state.neoforge_status =
                             String::from("NeoForge installed successfully.");
                         state.download_text =
@@ -1126,7 +2238,6 @@ impl DgrLauncher {
                         );
                     }
                     auth::WaitProgress::Waiting => (),
-                    auth::WaitProgress::Error(e) => println!("auth error: {e}"),
                     auth::WaitProgress::Finished => {
                         state.auth_code.code = String::new();
                         state.auth_code.link = String::new();
@@ -1154,16 +2265,8 @@ impl DgrLauncher {
                 persist_current_account(&state.current_account);
                 state.auth_status = String::from("Account added successfully!");
                 if state.screen == Screen::MicrosoftAccount{
-                    if state.is_first_launcher_use{
-                        if state.all_versions.is_empty(){
-                            state.screen = Screen::GettingStarted2;
-                        } else{
-                            state.screen = Screen::Main;
-                            state.is_first_launcher_use = false;
-                        }
-                    } else{
-                        state.screen = Screen::Accounts;
-                    }                }
+                    state.screen = Screen::Accounts;
+                }
                 Task::none()
             }
             Message::CopyToClipboard(content) => clipboard::write(content),
@@ -1211,16 +2314,7 @@ impl DgrLauncher {
                     state.accounts = save_account(account.clone());
                     state.current_account = account;
                     persist_current_account(&state.current_account);
-                    if state.is_first_launcher_use{
-                        if state.all_versions.is_empty(){
-                            state.screen = Screen::GettingStarted2;
-                        } else{
-                            state.screen = Screen::Main;
-                            state.is_first_launcher_use = false;
-                        }
-                    } else{
-                        state.screen = Screen::Accounts;
-                    }
+                    state.screen = Screen::Accounts;
                     state.local_account_to_add_name = String::new();
                 }
                 Task::none()
@@ -1266,6 +2360,9 @@ impl DgrLauncher {
         }
     }
     fn view(state: &DgrLauncher) -> Element<'_, Message> {
+        // Fixed full-height sidebar: top items stay on top, account and
+        // settings are pinned to the bottom via a Fill spacer, so the bar
+        // no longer jumps between pages of different heights.
         let sidebar = container(
             column![
                 action(
@@ -1278,26 +2375,18 @@ impl DgrLauncher {
                     .height(Length::Fixed(42.)),
                     "Main Screen"
                 ),
+
                 action(
                     button(svg(svg::Handle::from_memory(
-                        include_bytes!("icons/settings.svg").as_slice()
+                        include_bytes!("icons/info.svg").as_slice()
                     )))
-                    .on_press(Message::ChangeScreen(Screen::Settings))
+                    .on_press(Message::ChangeScreen(Screen::InfoAndUpdates))
                     .style(theme::transparent_button)
                     .width(Length::Fixed(42.))
                     .height(Length::Fixed(42.)),
-                    "Settings"
+                    "Info and updates"
                 ),
-                action(
-                    button(svg(svg::Handle::from_memory(
-                        include_bytes!("icons/download.svg").as_slice()
-                    )))
-                    .on_press(Message::ChangeScreen(Screen::Installation))
-                    .style(theme::transparent_button)
-                    .width(Length::Fixed(42.))
-                    .height(Length::Fixed(42.)),
-                    "Installer"
-                ),
+                space::vertical().height(Length::Fill),
                 action(
                     button(svg(svg::Handle::from_memory(
                         include_bytes!("icons/account.svg").as_slice()
@@ -1310,39 +2399,37 @@ impl DgrLauncher {
                 ),
                 action(
                     button(svg(svg::Handle::from_memory(
-                        include_bytes!("icons/info.svg").as_slice()
+                        include_bytes!("icons/settings.svg").as_slice()
                     )))
-                    .on_press(Message::ChangeScreen(Screen::InfoAndUpdates))
+                    .on_press(Message::ChangeScreen(Screen::Settings))
                     .style(theme::transparent_button)
                     .width(Length::Fixed(42.))
                     .height(Length::Fixed(42.)),
-                    "Info and updates"
-                )
+                    "Settings"
+                ),
             ]
-            .spacing(20)
-            .align_x(Alignment::Center),
+            .spacing(12)
+            .align_x(Alignment::Center)
+            .width(Length::Fill)
+            .height(Length::Fill),
         )
         .style(theme::black_container)
         .align_x(alignment::Horizontal::Center)
-        .align_y(alignment::Vertical::Center)
         .width(50)
-        .height(Length::Fixed(400.));
+        .height(Length::Fill)
+        .padding(4);
         let screen = screens::get_screen_content(state);
-        match state.is_first_launcher_use{
-            true =>      container(screen.height(Length::Fixed(400.))
+        container(
+            row![sidebar, screen]
+                .spacing(15)
+                .height(Length::Fill)
+                .align_y(Alignment::Start),
         )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_y(alignment::Vertical::Center)
-            .padding(15)
-            .into(),
-            false =>      container(row![sidebar, screen].spacing(65))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_y(alignment::Vertical::Center)
-            .padding(15)
-            .into(),
-        }
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_y(alignment::Vertical::Center)
+        .padding(15)
+        .into()
     }
     fn subscription(state: &DgrLauncher) -> Subscription<Message> {
         let mut subscriptions = Vec::new();

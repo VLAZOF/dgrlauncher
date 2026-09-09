@@ -154,6 +154,135 @@ pub fn red_button(_theme: &Theme, _status: button::Status) -> button::Style {
         snap: false,
     }
 }
+/// Big round green Play button (64x64). Radius 100 makes it a circle.
+pub fn round_play_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let active = button::Style {
+        background: Some(Background::Color(Color::from_rgb8(5, 194, 112))),
+        text_color: color!(205, 214, 244),
+        border: Border {
+            radius: 100.0.into(),
+            ..Default::default()
+        },
+        shadow: Shadow::default(),
+        snap: false,
+    };
+    match status {
+        button::Status::Active | button::Status::Pressed => active,
+        button::Status::Hovered => button::Style {
+            border: Border {
+                radius: 100.0.into(),
+                width: 1.0,
+                color: Color::from_rgb8(205, 214, 244),
+            },
+            ..active
+        },
+        button::Status::Disabled => button::Style {
+            background: Some(Background::Color(Color::from_rgb8(90, 115, 90))),
+            border: Border {
+                radius: 100.0.into(),
+                ..Default::default()
+            },
+            ..active
+        },
+    }
+}
+/// Big round red Stop button (64x64): replaces Play while the game runs.
+pub fn round_close_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let active = button::Style {
+        background: Some(Background::Color(Color::from_rgb8(210, 15, 57))),
+        text_color: color!(205, 214, 244),
+        border: Border {
+            radius: 100.0.into(),
+            ..Default::default()
+        },
+        shadow: Shadow::default(),
+        snap: false,
+    };
+    match status {
+        button::Status::Active | button::Status::Pressed => active,
+        button::Status::Hovered => button::Style {
+            border: Border {
+                radius: 100.0.into(),
+                width: 1.0,
+                color: Color::from_rgb8(205, 214, 244),
+            },
+            ..active
+        },
+        button::Status::Disabled => button::Style {
+            background: Some(Background::Color(Color::from_rgb8(90, 70, 75))),
+            border: Border {
+                radius: 100.0.into(),
+                ..Default::default()
+            },
+            ..active
+        },
+    }
+}
+/// Small round icon button (folder / gear), 44x44 circle.
+pub fn round_icon_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let active = button::Style {
+        background: Some(Background::Color(Color::from_rgb8(49, 50, 68))),
+        text_color: color!(205, 214, 244),
+        border: Border {
+            radius: 100.0.into(),
+            ..Default::default()
+        },
+        shadow: Shadow::default(),
+        snap: false,
+    };
+    match status {
+        button::Status::Active | button::Status::Pressed => active,
+        button::Status::Hovered => button::Style {
+            border: Border {
+                radius: 100.0.into(),
+                width: 1.0,
+                color: Color::from_rgb8(205, 214, 244),
+            },
+            ..active
+        },
+        button::Status::Disabled => button::Style {
+            background: Some(Background::Color(Color::from_rgb8(40, 42, 54))),
+            text_color: Color::from_rgb8(88, 91, 112),
+            border: Border {
+                radius: 100.0.into(),
+                ..Default::default()
+            },
+            shadow: Shadow::default(),
+            snap: false,
+        },
+    }
+}
+/// Instance row: highlighted when selected.
+pub fn instance_row_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme: &Theme, status: button::Status| {
+        let base = if selected {
+            Color::from_rgb8(30, 102, 245)
+        } else {
+            Color::from_rgb8(49, 50, 68)
+        };
+        let active = button::Style {
+            background: Some(Background::Color(base)),
+            text_color: color!(205, 214, 244),
+            border: Border {
+                radius: 15.0.into(),
+                ..Default::default()
+            },
+            shadow: Shadow::default(),
+            snap: false,
+        };
+        match status {
+            button::Status::Hovered => button::Style {
+                border: Border {
+                    radius: 15.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb8(205, 214, 244),
+                },
+                ..active
+            },
+            _ => active,
+        }
+    }
+}
 pub fn transparent_button(_theme: &Theme, status: button::Status) -> button::Style {
     match status {
         button::Status::Hovered => button::Style {
@@ -286,6 +415,12 @@ pub fn svg_default(_theme: &Theme, status: svg::Status) -> svg::Style {
         svg::Status::Hovered => svg::Style {
             color: Some(Color::from_rgb8(220, 220, 255)),
         },
+    }
+}
+/// Bright-orange icon (mod update indicator).
+pub fn orange_svg(_theme: &Theme, _status: svg::Status) -> svg::Style {
+    svg::Style {
+        color: Some(Color::from_rgb8(255, 165, 0)),
     }
 }
 impl svg::Catalog for Theme {
