@@ -2,7 +2,7 @@ use iced::{
     alignment,
     widget::{
         button, column, container, mouse_area, pick_list, row, scrollable, slider, svg, text,
-        text_input, toggler, tooltip, Column,
+        text_input, toggler, tooltip, Column, Row,
     },
     Alignment, Length,
 };
@@ -30,31 +30,49 @@ fn instance_details(id: &str, java_name: &str) -> (String, String) {
         id,
         id
     );
-    let (mc_id, required) = match std::fs::read_to_string(&json_path) {
-        Ok(content) => match serde_json::from_str::<Value>(&content) {
-            Ok(v) => {
-                let mc_id = v["inheritsFrom"]
-                    .as_str()
-                    .unwrap_or(id)
-                    .to_owned();
-                let required = v["javaVersion"]["majorVersion"]
-                    .as_u64()
-                    .unwrap_or_else(|| crate::launcher::fallback_java_major(&mc_id));
-                (mc_id, required)
+    // Missing/corrupt json: say so honestly instead of guessing Java 8
+    // from a user-chosen folder name via the fallback table.
+    let parsed: Option<Value> = std::fs::read_to_string(&json_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok());
+    let java_line = match parsed {
+        Some(v) => {
+            let mc_id = v["inheritsFrom"].as_str().unwrap_or(id).to_owned();
+            let required = v["javaVersion"]["majorVersion"]
+                .as_u64()
+                .unwrap_or_else(|| crate::launcher::fallback_java_major(&mc_id));
+            if java_name == "Automatic" || java_name.is_empty() {
+                format!("Java: Automatic (requires Java {required})")
+            } else {
+                format!("Java: {java_name}")
             }
-            Err(_) => (id.to_owned(), crate::launcher::fallback_java_major(id)),
-        },
-        Err(_) => (id.to_owned(), crate::launcher::fallback_java_major(id)),
-    };
-    let _ = mc_id;
-    let java_line = if java_name == "Automatic" {
-        format!("Java: Automatic (requires Java {required})")
-    } else if java_name.is_empty() {
-        String::from("Java: Automatic")
-    } else {
-        format!("Java: {java_name}")
+        }
+        None => String::from("Java: unknown — version files missing"),
     };
     (mc_line, java_line)
+}
+
+/// Shared memory row (global settings and per-instance settings):
+/// value label + slider + manual input. The instance screen appends its
+/// own "Global" reset button to the returned row.
+fn ram_controls<'a>(
+    value: f64,
+    input: &'a str,
+    on_slider: fn(f64) -> Message,
+    on_input: fn(String) -> Message,
+) -> Row<'a, Message, super::theme::Theme, Renderer> {
+    row![
+        text(format!("{value:.1} GiB")).size(14).width(Length::Fixed(80.)),
+        slider(0.5..=16.0, value, on_slider)
+            .step(0.25)
+            .width(Length::Fill),
+        text_input("GiB", input)
+            .on_input(on_input)
+            .size(14)
+            .width(80),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
 }
 
 /// One-line description: single line, capped length.
@@ -419,69 +437,106 @@ pub fn get_screen_content<'a>(
             }
             main
         }
-        Screen::Settings => column![
-            text("Settings").size(50),
-            row![
+        Screen::Settings => {
+            let update_line = if app.update_available {
+                format!(
+                    "Update available: {} -> {}",
+                    env!("CARGO_PKG_VERSION"),
+                    app.last_version
+                )
+            } else {
+                app.last_version.clone()
+            };
+            column![
+                text("Settings").size(30),
                 container(
                     column![
-                        column![
-                            text("Java:"),
+                        text("Default settings").size(20),
+                        row![
+                            text("Java:").size(14).width(Length::Fixed(120.)),
                             pick_list(
                                 app.java_name_list.clone(),
                                 Some(app.current_java_name.clone()),
                                 Message::JavaChanged
                             )
-                            .width(250)
-                            .text_size(25),
-                            button(
-                                text("Custom Java")
-                                    .width(250)
-                                    .align_x(alignment::Horizontal::Center)
+                            .width(220)
+                            .text_size(14),
+                            button(text("Custom Java").size(13))
+                                .on_press(Message::ChangeScreen(Screen::CustomJava))
+                                .padding(6),
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                        ram_controls(
+                            app.game_ram,
+                            &app.settings_ram_text,
+                            Message::GameRamChanged,
+                            Message::SettingsRamText,
+                        ),
+                        text(&app.settings_status)
+                            .size(12)
+                            .style(theme::peach_text),
+                        row![
+                            button(text("Wrapper commands").size(13))
+                                .on_press(Message::ChangeScreen(
+                                    Screen::ModifyCommand
+                                ))
+                                .padding(6),
+                        ]
+                        .spacing(10),
+                        text("Other").size(20),
+                        row![
+                            text(update_line).size(13).width(Length::Fill),
+                            tooltip(
+                                button(svg(svg::Handle::from_memory(
+                                    include_bytes!("icons/refresh.svg").as_slice(),
+                                )))
+                                .on_press(Message::RecheckUpdates)
+                                .style(theme::transparent_button)
+                                .width(28)
+                                .height(28)
+                                .padding(2),
+                                "Check for updates",
+                                tooltip::Position::Top,
                             )
-                            .height(32)
-                            .on_press(Message::ChangeScreen(Screen::CustomJava))
+                            .style(theme::black_container),
+                            tooltip(
+                                button(svg(svg::Handle::from_memory(
+                                    include_bytes!("icons/github.svg").as_slice(),
+                                )))
+                                .on_press(Message::OpenURL(
+                                    "https://github.com/VLAZOF/dgrlauncher".to_string()
+                                ))
+                                .style(theme::transparent_button)
+                                .width(28)
+                                .height(28)
+                                .padding(2),
+                                "GitHub repository",
+                                tooltip::Position::Top,
+                            )
+                            .style(theme::black_container),
+                            button(text("Update").size(13))
+                                .on_press_maybe(if app.update_available {
+                                    Some(Message::Update)
+                                } else {
+                                    None
+                                })
+                                .style(theme::secondary_button)
+                                .padding(6),
                         ]
                         .spacing(10)
-                        .max_width(800),
-                        column![
-                            text("Game data folder:"),
-                            text(if app.current_version.is_empty() {
-                                String::from("Select a version first")
-                            } else {
-                                super::game_instance_dir_for_version(&app.current_version)
-                            })
-                            .size(13),
-                            text("Each version keeps its own saves, mods and configs.").size(12)
-                        ]
-                        .spacing(10)
-                        .max_width(800)
+                        .align_y(Alignment::Center),
+                        text(&app.update_text).size(12),
                     ]
-                    .spacing(10)
+                    .spacing(12)
                 )
                 .style(theme::black_container)
-                .padding(10),
-                container(
-                    column![
-                        column![
-                            text(format!("Allocated memory: {}GiB", app.game_ram))
-                                .size(25)
-                                .align_x(alignment::Horizontal::Center),
-                            slider(0.5..=16.0, app.game_ram, Message::GameRamChanged)
-                                .width(250)
-                                .step(0.5)
-                        ],
-                        button("Add wrapper commands")
-                            .on_press(Message::ChangeScreen(Screen::ModifyCommand))
-                    ]
-                    .spacing(50)
-                )
-                .style(theme::black_container)
-                .padding(10)
+                .padding(15)
+                .width(Length::Fill),
             ]
-            .spacing(15),
-        ]
-        .spacing(15)
-        .max_width(800),
+            .spacing(15)
+            .width(Length::Fill)
+        }
         Screen::Installation => {
             use crate::LoaderChoice;
             let mc_pick_list = pick_list(
@@ -576,6 +631,14 @@ pub fn get_screen_content<'a>(
                         text("Minecraft version").size(20),
                         mc_pick_list,
                         loader_column,
+                        text("Instance name (optional)").size(14),
+                        text_input(
+                            "Empty = default version id",
+                            &app.install_name
+                        )
+                        .on_input(Message::InstallNameChanged)
+                        .size(14)
+                        .width(250),
                         install_button,
                     ]
                     .spacing(15)
@@ -681,75 +744,6 @@ pub fn get_screen_content<'a>(
             .size(12)
         ]
         .spacing(25),
-        Screen::InfoAndUpdates => {
-            let credits = format!("DgrLauncher {} by VLAZOF.", env!("CARGO_PKG_VERSION"));
-            let update_text = if app.update_available {
-                format!(
-                    "Update available: {} -> {}",
-                    env!("CARGO_PKG_VERSION"),
-                    app.last_version
-                )
-            } else {
-                app.last_version.clone()
-            };
-            let update_button_message = match app.update_available {
-                true => Some(Message::Update),
-                false => None,
-            };
-            column![
-                text("Info and updates").size(50),
-                row![
-                    container(
-                        column![
-                            row![
-                                text("Updates").size(15),
-                                tooltip(
-                                    button(svg(svg::Handle::from_memory(
-                                        include_bytes!("icons/refresh.svg").as_slice(),
-                                    )))
-                                    .on_press(Message::RecheckUpdates)
-                                    .style(theme::transparent_button)
-                                    .width(28)
-                                    .height(28)
-                                    .padding(2),
-                                    "Check for updates",
-                                    tooltip::Position::Top,
-                                )
-                                .style(theme::black_container)
-                            ]
-                            .spacing(8)
-                            .align_y(Alignment::Center),
-                            text(update_text),
-                            button("Update")
-                                .on_press_maybe(update_button_message)
-                                .style(theme::secondary_button)
-                                .padding(5),
-                            text(app.update_text.clone())
-                        ]
-                        .spacing(30)
-                    )
-                    .style(theme::black_container)
-                    .padding(20),
-                    container(
-                        column![
-                            text("Info").size(15),
-                            text(credits),
-                            row![button(text("Github repository").size(12))
-                                .on_press(Message::OpenURL(
-                                    "https://github.com/VLAZOF/dgrlauncher".to_string()
-                                ))
-                                .padding(5)]
-                            .spacing(10)
-                        ]
-                        .spacing(30)
-                    )
-                    .style(theme::black_container)
-                    .padding(20)
-                ]
-                .spacing(15),
-            ]
-            .spacing(25)
-        }
         Screen::Accounts => {
             let mut accounts_column = column![];
             for i in &app.accounts {
@@ -870,7 +864,7 @@ pub fn get_screen_content<'a>(
             }
             // Loader switch block depends on the instance kind.
             let loader_block: Column<'a, Message, super::theme::Theme, Renderer> =
-                if app.current_version.ends_with("-fabric") {
+                if crate::version_kind(&app.current_version) == crate::VersionKind::Fabric {
                     column![
                         text("Fabric loader").size(15),
                         pick_list(
@@ -895,7 +889,9 @@ pub fn get_screen_content<'a>(
                         text(&app.download_text).size(12),
                     ]
                     .spacing(8)
-                } else if app.current_version.starts_with("neoforge-") {
+                } else if crate::version_kind(&app.current_version)
+                    == crate::VersionKind::NeoForge
+                {
                     column![
                         text("NeoForge version").size(15),
                         pick_list(
@@ -951,24 +947,17 @@ pub fn get_screen_content<'a>(
                 .align_y(Alignment::Center),
                 icon_row,
                 text(format!("Memory (global: {:.1} GiB)", app.game_ram)).size(15),
-                row![
-                    slider(
-                        0.5..=16.0,
-                        eff_ram,
-                        Message::InstanceRamSlider
-                    )
-                    .step(0.25)
-                    .width(Length::Fill),
-                    text_input("GiB", &app.instance_ram_text)
-                        .on_input(Message::InstanceRamText)
-                        .size(14)
-                        .width(80),
+                ram_controls(
+                    eff_ram,
+                    &app.instance_ram_text,
+                    Message::InstanceRamSlider,
+                    Message::InstanceRamText,
+                )
+                .push(
                     button(text("Global").size(12))
                         .on_press(Message::InstanceRamReset)
                         .padding(6),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
+                ),
                 text("Java (Global = Settings choice)").size(15),
                 pick_list(
                     vec![
@@ -1037,6 +1026,13 @@ pub fn get_screen_content<'a>(
             ]
             .spacing(10);
             if app.modstore_tab == ModStoreTab::Installed {
+                // Refresh re-reads the mods folder (hand-dropped files show
+                // up without leaving the tab); Check updates hits Modrinth.
+                tabs_row = tabs_row.push(
+                    button(text("Refresh").size(12))
+                        .on_press(Message::ModStoreTabChanged(ModStoreTab::Installed))
+                        .padding(6),
+                );
                 tabs_row = tabs_row.push(
                     button(text("Check updates").size(12))
                         .on_press_maybe(if app.modstore_pending_checks == 0 {

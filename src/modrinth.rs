@@ -306,12 +306,12 @@ pub async fn fetch_icon(url: &str) -> Option<Vec<u8>> {
 /// (the store button stays disabled there).
 /// Reads `{minecraft_dir}/versions/{id}/{id}.json` when available.
 pub fn instance_loader(version_id: &str) -> Option<(String, String)> {
-    let loader = if version_id.contains("neoforge") {
-        "neoforge"
-    } else if version_id.contains("fabric") {
-        "fabric"
-    } else {
-        return None;
+    // Content-based (rename-proof): folder names are user-chosen.
+    let loader = match crate::version_kind(version_id) {
+        crate::VersionKind::Fabric => "fabric",
+        crate::VersionKind::NeoForge => "neoforge",
+        crate::VersionKind::Forge => "forge",
+        _ => return None,
     };
     let json_path = format!(
         "{}/versions/{}/{}.json",
@@ -322,9 +322,9 @@ pub fn instance_loader(version_id: &str) -> Option<(String, String)> {
     let mc = std::fs::read_to_string(&json_path)
         .ok()
         .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-        .and_then(|v| v["inheritsFrom"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| version_id.to_owned());
-    Some((mc, loader.to_owned()))
+        .and_then(|v| v["inheritsFrom"].as_str().map(str::to_owned));
+    // Without inheritsFrom there is no modded context at all.
+    mc.map(|mc| (mc, loader.to_owned()))
 }
 
 // ---------------------------------------------------------------------------

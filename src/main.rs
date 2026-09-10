@@ -173,6 +173,16 @@ struct DgrLauncher {
     il_manual: String,
     il_status: String,
     pending_loader_switch: Option<String>,
+    /// Optional custom instance name typed on the Installation screen.
+    install_name: String,
+    /// Global RAM manual input mirror + validation hint (Settings).
+    settings_ram_text: String,
+    settings_status: String,
+    /// `(default version id, custom name)` renames applied when each
+    /// install finishes (validated at press, executed at finish).
+    pending_install_names: Vec<(String, String)>,
+    /// Status notice generation: terminal notices auto-clear after 5s.
+    notice_seq: u32,
 }
 #[derive(Default, Serialize, Deserialize, Clone)]
 struct Account {
@@ -267,7 +277,6 @@ pub enum Screen {
     CustomJava,
     Logs,
     ModifyCommand,
-    InfoAndUpdates,
     Accounts,
     MicrosoftAccount,
     LocalAccount,
@@ -358,6 +367,9 @@ enum Message {
     InstanceJavaChanged(String),
     GotInstanceFabricLoaders(Result<Vec<String>, String>),
     GotInstanceNeoForgeList(Result<Vec<(String, String)>, String>),
+    InstallNameChanged(String),
+    SettingsRamText(String),
+    ClearNotices(u32),
     InstanceLoaderChanged(String),
     InstanceLoaderManualChanged(String),
     InstanceLoaderReload,
@@ -546,6 +558,10 @@ fn boot() -> (DgrLauncher, Task<Message>) {
                 current_version,
                 current_version_info,
                 game_ram: p["game_ram"].as_f64().unwrap(),
+                settings_ram_text: format!(
+                    "{:.2}",
+                    p["game_ram"].as_f64().unwrap()
+                ),
                 current_java_name: currentjava.name.clone(),
                 current_java: currentjava,
                 game_wrapper_commands: p["game_wrapper_commands"].as_str().unwrap().to_owned(),
@@ -615,6 +631,18 @@ impl DgrLauncher {
             ));
         }
         tasks
+    }
+    /// Auto-clear terminal status notices after 5s. Callers bump
+    /// `notice_seq` first and batch this with their return task; a stale
+    /// timer never clears a newer notice.
+    fn clear_notices_later(seq: u32) -> Task<Message> {
+        Task::perform(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                seq
+            },
+            Message::ClearNotices,
+        )
     }
     /// Scroll the catalog back to the saved offset.
     fn restore_store_scroll(y: f32) -> Task<Message> {
@@ -900,6 +928,8 @@ impl DgrLauncher {
                     Err(err) => {
                         state.modstore_results = Vec::new();
                         state.modstore_status = err;
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
                     }
                 }
                 // Fetch missing icons in the background (cube fallback meanwhile).
@@ -990,9 +1020,10 @@ impl DgrLauncher {
                     }
                     Err(err) => {
                         state.modstore_status = err;
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
                     }
                 }
-                Task::none()
             }
             Message::ModIconLoaded(url, bytes) => {
                 let handle = bytes.map(iced::widget::image::Handle::from_bytes);
@@ -1040,6 +1071,7 @@ impl DgrLauncher {
             }
             Message::ModLinkFinished(result) => {
                 state.modstore_linking = false;
+                let mut armed = false;
                 match result {
                     Ok(n) => {
                         state.modstore_installed =
@@ -1050,6 +1082,7 @@ impl DgrLauncher {
                             state.modstore_status = format!(
                                 "Linked {n} hand-added mod(s) ✓"
                             );
+                            armed = true;
                         } else if state.modstore_status
                             == "Identifying hand-added files..."
                         {
@@ -1058,7 +1091,12 @@ impl DgrLauncher {
                     }
                     Err(err) => {
                         state.modstore_status = err;
+                        armed = true;
                     }
+                }
+                if armed {
+                    state.notice_seq = state.notice_seq.wrapping_add(1);
+                    return clear_notices_later(state.notice_seq);
                 }
                 Task::none()
             }
@@ -1084,7 +1122,8 @@ impl DgrLauncher {
                     state.modstore_delete_confirm = None;
                     state.modstore_unlinked =
                         modrinth::unlinked_mod_files(&state.current_version);
-                    return Task::none();
+                    state.notice_seq = state.notice_seq.wrapping_add(1);
+                    return clear_notices_later(state.notice_seq);
                 }
                 state.modstore_delete_confirm = Some(key);
                 Task::none()
@@ -1125,6 +1164,8 @@ impl DgrLauncher {
             }
             Message::ModInstallFinished(result) => {
                 state.modstore_downloading = false;
+                state.notice_seq = state.notice_seq.wrapping_add(1);
+                let notice = clear_notices_later(state.notice_seq);
                 match result {
                     Ok(entry) => {
                         state.modstore_status =
@@ -1165,7 +1206,7 @@ impl DgrLauncher {
                         state.modstore_status = err;
                     }
                 }
-                Task::none()
+                return notice;
             }
             Message::ModDeletePressed(project_id) => {
                 if state.modstore_delete_confirm.as_deref() == Some(&project_id) {
@@ -1184,7 +1225,8 @@ impl DgrLauncher {
                     }
                     state.modstore_installed =
                         modrinth::installed_mods(&state.current_version);
-                    return Task::none();
+                    state.notice_seq = state.notice_seq.wrapping_add(1);
+                    return clear_notices_later(state.notice_seq);
                 }
                 // First click: arm confirmation.
                 state.modstore_delete_confirm = Some(project_id);
@@ -1212,7 +1254,8 @@ impl DgrLauncher {
                     } else {
                         String::from("All mods up to date ✓")
                     };
-                    return Task::none();
+                    state.notice_seq = state.notice_seq.wrapping_add(1);
+                    return clear_notices_later(state.notice_seq);
                 }
                 state.modstore_check_manual = true;
                 state.modstore_status = String::from("Checking updates...");
@@ -1236,6 +1279,8 @@ impl DgrLauncher {
                     } else {
                         format!("{} update(s) available", state.modstore_updates.len())
                     };
+                    state.notice_seq = state.notice_seq.wrapping_add(1);
+                    return clear_notices_later(state.notice_seq);
                 }
                 Task::none()
             }
@@ -1320,11 +1365,9 @@ impl DgrLauncher {
                 state.il_loader_list = Vec::new();
                 state.il_selected = String::new();
                 // Prefill loader switch data for modded instances.
-                if state.current_version.ends_with("-fabric") {
-                    let base = state
-                        .current_version
-                        .trim_end_matches("-fabric")
-                        .to_owned();
+                // Kind (not the folder name): names are user-chosen.
+                if version_kind(&state.current_version) == VersionKind::Fabric {
+                    let base = instance_base_mc(&state.current_version);
                     return Task::perform(
                         async move {
                             downloader::get_fabric_loader_versions(&base).await
@@ -1332,7 +1375,7 @@ impl DgrLauncher {
                         Message::GotInstanceFabricLoaders,
                     );
                 }
-                if state.current_version.starts_with("neoforge-") {
+                if version_kind(&state.current_version) == VersionKind::NeoForge {
                     if state.neoforge_all.is_empty() {
                         return Task::perform(
                             downloader::get_neoforge_versions(),
@@ -1358,84 +1401,28 @@ impl DgrLauncher {
             Message::InstanceRenamePressed => {
                 let old = state.current_version.clone();
                 let new = state.instance_name_edit.trim().to_owned();
-                let mc_dir = launcher::get_minecraft_dir();
-                if new.is_empty()
-                    || new == "."
-                    || new == ".."
-                    || new.contains('/')
-                    || new.contains('\\')
-                {
-                    state.instance_settings_status = String::from("Invalid name.");
-                    return Task::none();
-                }
-                if new == old {
-                    state.instance_settings_status =
-                        String::from("Same name, nothing to do.");
-                    return Task::none();
-                }
-                if Path::new(&format!("{mc_dir}/versions/{new}")).exists() {
-                    state.instance_settings_status =
-                        String::from("A version with this name already exists.");
-                    return Task::none();
-                }
-                // 1. Version dir (authoritative for launch).
-                if let Err(e) = fs::rename(
-                    format!("{mc_dir}/versions/{old}"),
-                    format!("{mc_dir}/versions/{new}"),
-                ) {
-                    state.instance_settings_status = format!("Rename failed: {e}");
-                    return Task::none();
-                }
-                // 2. Inner files follow the folder name; patch "id" to match.
-                for ext in ["json", "jar"] {
-                    let from = format!("{mc_dir}/versions/{new}/{old}.{ext}");
-                    if Path::new(&from).exists() {
-                        if let Err(e) = fs::rename(
-                            &from,
-                            format!("{mc_dir}/versions/{new}/{new}.{ext}"),
-                        ) {
-                            state.instance_settings_status =
-                                format!("Rename failed: {e}");
-                            return Task::none();
-                        }
+                match rename_instance(&launcher::get_minecraft_dir(), &old, &new) {
+                    Ok(()) => {
+                        state.current_version = new.clone();
+                        state.current_version_info = describe_version(&new);
+                        state.delete_confirm = None;
+                        state.instance_name_edit = new;
+                        state.instance_settings_status = String::from("Renamed ✓");
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return Task::batch(vec![
+                            Task::perform(
+                                launcher::getinstalledversions(),
+                                Message::LoadVersionList,
+                            ),
+                            clear_notices_later(state.notice_seq),
+                        ]);
+                    }
+                    Err(e) => {
+                        state.instance_settings_status = e;
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
                     }
                 }
-                let new_json = format!("{mc_dir}/versions/{new}/{new}.json");
-                if let Ok(content) = fs::read_to_string(&new_json) {
-                    if let Ok(mut v) = serde_json::from_str::<Value>(&content) {
-                        if v["id"].as_str() == Some(old.as_str()) {
-                            v["id"] = Value::String(new.clone());
-                            if let Ok(text) = serde_json::to_string_pretty(&v) {
-                                let _ = fs::write(&new_json, text);
-                            }
-                        }
-                    }
-                }
-                // 3. Instance data dir (saves, mods, configs move along).
-                let old_inst = game_instance_dir_for_version(&old);
-                if Path::new(&old_inst).exists() {
-                    if let Err(e) =
-                        fs::rename(&old_inst, game_instance_dir_for_version(&new))
-                    {
-                        state.instance_settings_status = format!(
-                            "Version renamed, but instance folder failed: {e}"
-                        );
-                    }
-                }
-                state.current_version = new.clone();
-                state.current_version_info = describe_version(&new);
-                state.delete_confirm = None;
-                state.instance_name_edit = new.clone();
-                if !state
-                    .instance_settings_status
-                    .starts_with("Version renamed")
-                {
-                    state.instance_settings_status = String::from("Renamed ✓");
-                }
-                return Task::perform(
-                    launcher::getinstalledversions(),
-                    Message::LoadVersionList,
-                );
             }
             Message::InstanceIconChanged(preset) => {
                 let mut cfg = read_instance_config(&state.current_version);
@@ -1446,6 +1433,8 @@ impl DgrLauncher {
                 };
                 if let Err(e) = write_instance_config(&state.current_version, &cfg) {
                     state.instance_settings_status = e;
+                    state.notice_seq = state.notice_seq.wrapping_add(1);
+                    return clear_notices_later(state.notice_seq);
                 }
                 Task::none()
             }
@@ -1478,6 +1467,8 @@ impl DgrLauncher {
                     _ => {
                         state.instance_settings_status =
                             String::from("Enter 0.5 – 32 (GiB).");
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
                     }
                 }
                 Task::none()
@@ -1512,7 +1503,11 @@ impl DgrLauncher {
                         state.il_selected = list.first().cloned().unwrap_or_default();
                         state.il_status = String::new();
                     }
-                    Err(err) => state.il_status = err,
+                    Err(err) => {
+                        state.il_status = err;
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
+                    }
                 }
                 Task::none()
             }
@@ -1535,7 +1530,11 @@ impl DgrLauncher {
                             .unwrap_or_default();
                         state.il_status = String::new();
                     }
-                    Err(err) => state.il_status = err,
+                    Err(err) => {
+                        state.il_status = err;
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
+                    }
                 }
                 Task::none()
             }
@@ -1552,11 +1551,8 @@ impl DgrLauncher {
                 state.il_status = String::from("Loading loader versions...");
                 state.il_loader_list = Vec::new();
                 state.il_selected = String::new();
-                if state.current_version.ends_with("-fabric") {
-                    let base = state
-                        .current_version
-                        .trim_end_matches("-fabric")
-                        .to_owned();
+                if version_kind(&state.current_version) == VersionKind::Fabric {
+                    let base = instance_base_mc(&state.current_version);
                     return Task::perform(
                         async move {
                             downloader::get_fabric_loader_versions(&base).await
@@ -1570,16 +1566,14 @@ impl DgrLauncher {
                 );
             }
             Message::InstanceLoaderApply => {
-                if state.current_version.ends_with("-fabric") {
+                if version_kind(&state.current_version) == VersionKind::Fabric {
                     if state.il_selected.is_empty() {
                         state.il_status =
                             String::from("Select a Fabric loader version first.");
-                        return Task::none();
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
                     }
-                    let base = state
-                        .current_version
-                        .trim_end_matches("-fabric")
-                        .to_owned();
+                    let base = instance_base_mc(&state.current_version);
                     let loader = state.il_selected.clone();
                     state.il_status = format!(
                         "Downloading Fabric {loader}... (progress on Installation screen)"
@@ -1592,7 +1586,7 @@ impl DgrLauncher {
                     );
                     return Task::none();
                 }
-                if state.current_version.starts_with("neoforge-") {
+                if version_kind(&state.current_version) == VersionKind::NeoForge {
                     let nf = if !state.il_manual.trim().is_empty() {
                         state.il_manual.trim().to_owned()
                     } else {
@@ -1602,7 +1596,8 @@ impl DgrLauncher {
                         state.il_status = String::from(
                             "Select a NeoForge version or enter it manually.",
                         );
-                        return Task::none();
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
                     }
                     let mc = instance_base_mc(&state.current_version);
                     state.pending_neoforge_install = Some((mc.clone(), nf.clone()));
@@ -1758,6 +1753,23 @@ impl DgrLauncher {
             }
             Message::GameRamChanged(new_ram) => {
                 state.game_ram = new_ram;
+                state.settings_ram_text = format!("{new_ram:.2}");
+                state.settings_status = String::new();
+                Task::none()
+            }
+            Message::SettingsRamText(s) => {
+                state.settings_ram_text = s.clone();
+                let normalized = s.replace(',', ".");
+                match normalized.trim().parse::<f64>() {
+                    Ok(v) if (0.5..=32.0).contains(&v) => {
+                        state.game_ram = v;
+                        state.settings_status = String::new();
+                    }
+                    _ => {
+                        state.settings_status =
+                            String::from("Enter 0.5 – 32 (GiB).");
+                    }
+                }
                 Task::none()
             }
             Message::GameWrapperCommandsChanged(s) => {
@@ -1784,7 +1796,11 @@ impl DgrLauncher {
                             }
                         }
                     }
-                    Err(err) => state.download_text = err,
+                    Err(err) => {
+                        state.download_text = err;
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
+                    }
                 }
                 Task::none()
             }
@@ -1852,7 +1868,11 @@ impl DgrLauncher {
                         state.fabric_loader_selected =
                             list.first().cloned().unwrap_or_default();
                     }
-                    Err(err) => state.download_text = err,
+                    Err(err) => {
+                        state.download_text = err;
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
+                    }
                 }
                 Task::none()
             }
@@ -1887,16 +1907,58 @@ impl DgrLauncher {
                 state.neoforge_manual = version;
                 Task::none()
             }
+            Message::InstallNameChanged(name) => {
+                state.install_name = name;
+                Task::none()
+            }
+            Message::ClearNotices(seq) => {
+                // Delayed reset of terminal status notices (5s). Stale
+                // timers (a newer notice arrived) never clear fresh text.
+                // Progress lines ("Downloading...") are never armed.
+                if seq == state.notice_seq {
+                    state.download_text = String::new();
+                    state.neoforge_status = String::new();
+                    state.modstore_status = String::new();
+                    state.instance_settings_status = String::new();
+                    state.il_status = String::new();
+                }
+                Task::none()
+            }
             Message::InstallPressed => {
                 // A manual install cancels a pending loader switch target.
                 state.pending_loader_switch = None;
                 if state.install_mc_version.is_empty() {
                     state.download_text = String::from("Select a Minecraft version first.");
-                    return Task::none();
+                    state.notice_seq = state.notice_seq.wrapping_add(1);
+                    return clear_notices_later(state.notice_seq);
                 }
+                // Optional custom instance name, validated now (fail fast);
+                // applied to the finished version dir (see Finished).
+                let custom = state.install_name.trim().to_owned();
+                if !custom.is_empty() {
+                    if let Err(e) = valid_new_instance_name(
+                        &launcher::get_minecraft_dir(),
+                        &custom,
+                    ) {
+                        state.download_text = e;
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
+                    }
+                }
+                // Remember (default id -> custom) for the finish handler.
+                // `custom == default` needs no rename.
+                let mut remember_custom = |default_id: String| {
+                    state.pending_install_names.retain(|(o, _)| *o != default_id);
+                    if !custom.is_empty() && custom != default_id {
+                        state
+                            .pending_install_names
+                            .push((default_id, custom.clone()));
+                    }
+                };
                 match state.install_loader {
                     LoaderChoice::Vanilla => {
                         let version = state.install_mc_version.clone();
+                        remember_custom(version.clone());
                         state.downloaders
                             .push(Downloader::new(state.downloaders.len()));
                         let index = state.downloaders.len() - 1;
@@ -1907,10 +1969,12 @@ impl DgrLauncher {
                         if state.fabric_loader_selected.is_empty() {
                             state.download_text =
                                 String::from("Select a Fabric loader version first.");
-                            return Task::none();
+                            state.notice_seq = state.notice_seq.wrapping_add(1);
+                            return clear_notices_later(state.notice_seq);
                         }
                         let version = state.install_mc_version.clone();
                         let loader = state.fabric_loader_selected.clone();
+                        remember_custom(format!("{version}-fabric"));
                         state.downloaders
                             .push(Downloader::new(state.downloaders.len()));
                         let index = state.downloaders.len() - 1;
@@ -1929,8 +1993,10 @@ impl DgrLauncher {
                             state.neoforge_status = String::from(
                                 "Select a NeoForge version or enter it manually.",
                             );
-                            return Task::none();
+                            state.notice_seq = state.notice_seq.wrapping_add(1);
+                            return clear_notices_later(state.notice_seq);
                         }
+                        remember_custom(format!("neoforge-{nf}"));
                         let mc = state.install_mc_version.clone();
                         // Remember the target through the whole chain
                         // (vanilla prefetch -> installer -> optional java).
@@ -1968,12 +2034,58 @@ impl DgrLauncher {
                         );
                     }
                     downloader::Progress::Finished => {
-                        state.download_text = String::from("Version installed successfully.");
+                        // Which version dir just finished? (MC id vs
+                        // "{mc}-fabric" mapping lives in the helper.)
+                        let finished_version = state
+                            .downloaders
+                            .iter()
+                            .find(|d| d.id == id)
+                            .and_then(|d| finished_version_dir_id(&d.state));
+                        state.download_text =
+                            String::from("Version installed successfully.");
                         for (index, downloader) in state.downloaders.iter().enumerate() {
                             if downloader.id == id {
                                 state.downloaders.remove(index);
                                 break;
                             }
+                        }
+                        // Custom instance name: rename the finished version.
+                        let mut refresh = false;
+                        if let Some(old_id) = finished_version {
+                            if let Some(pos) = state
+                                .pending_install_names
+                                .iter()
+                                .position(|(o, _)| *o == old_id)
+                            {
+                                let (_, custom) =
+                                    state.pending_install_names.remove(pos);
+                                match rename_instance(
+                                    &launcher::get_minecraft_dir(),
+                                    &old_id,
+                                    &custom,
+                                ) {
+                                    Ok(()) => {
+                                        state.download_text = format!(
+                                            "Version installed as {custom}."
+                                        );
+                                        refresh = true;
+                                    }
+                                    Err(e) => {
+                                        state.download_text = format!(
+                                            "Installed, but rename failed: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        let mut done_tasks =
+                            vec![clear_notices_later(state.notice_seq)];
+                        if refresh {
+                            done_tasks.push(Task::perform(
+                                launcher::getinstalledversions(),
+                                Message::LoadVersionList,
+                            ));
                         }
                         // Vanilla prefetch for NeoForge done and nothing else
                         // is downloading: continue with the installer.
@@ -1985,6 +2097,7 @@ impl DgrLauncher {
                                 state.downloaders[index].start_neoforge(mc, nf);
                             }
                         }
+                        return Task::batch(done_tasks);
                     }
                     downloader::Progress::Errored(error) => {
                         state.download_text = format!("Failed to install: {error}");
@@ -1997,6 +2110,8 @@ impl DgrLauncher {
                                 break;
                             }
                         }
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return clear_notices_later(state.notice_seq);
                     }
                     downloader::Progress::StartedJavaDownload(size) => {
                         state.restrict_launch = true;
@@ -2054,6 +2169,11 @@ impl DgrLauncher {
                     }
                     downloader::Progress::NeoForgeFinished => {
                         state.restrict_launch = false;
+                        // Custom name for the freshly installed instance.
+                        let finished_nf = state
+                            .pending_neoforge_install
+                            .clone()
+                            .map(|(_, nf)| nf);
                         state.pending_neoforge_install = None;
                         // Loader switch from instance settings: move the
                         // selection to the freshly installed instance.
@@ -2068,16 +2188,47 @@ impl DgrLauncher {
                             String::from("NeoForge installed successfully.");
                         state.download_text =
                             String::from("NeoForge installed successfully.");
+                        if let Some(nf) = finished_nf {
+                            let old_id = format!("neoforge-{nf}");
+                            if let Some(pos) = state
+                                .pending_install_names
+                                .iter()
+                                .position(|(o, _)| *o == old_id)
+                            {
+                                let (_, custom) =
+                                    state.pending_install_names.remove(pos);
+                                match rename_instance(
+                                    &launcher::get_minecraft_dir(),
+                                    &old_id,
+                                    &custom,
+                                ) {
+                                    Ok(()) => {
+                                        state.download_text = format!(
+                                            "NeoForge installed as {custom}."
+                                        );
+                                    }
+                                    Err(e) => {
+                                        state.download_text = format!(
+                                            "Installed, but rename failed: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         for (index, downloader) in state.downloaders.iter().enumerate() {
                             if downloader.id == id {
                                 state.downloaders.remove(index);
                                 break;
                             }
                         }
-                        return Task::perform(
-                            launcher::getinstalledversions(),
-                            Message::LoadVersionList,
-                        );
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return Task::batch(vec![
+                            Task::perform(
+                                launcher::getinstalledversions(),
+                                Message::LoadVersionList,
+                            ),
+                            clear_notices_later(state.notice_seq),
+                        ]);
                     }
                     downloader::Progress::MissingFilesDownloadProgressed(missing_files) => {
                         state.restrict_launch = true;
@@ -2376,16 +2527,6 @@ impl DgrLauncher {
                     "Main Screen"
                 ),
 
-                action(
-                    button(svg(svg::Handle::from_memory(
-                        include_bytes!("icons/info.svg").as_slice()
-                    )))
-                    .on_press(Message::ChangeScreen(Screen::InfoAndUpdates))
-                    .style(theme::transparent_button)
-                    .width(Length::Fixed(42.))
-                    .height(Length::Fixed(42.)),
-                    "Info and updates"
-                ),
                 space::vertical().height(Length::Fill),
                 action(
                     button(svg(svg::Handle::from_memory(
@@ -2587,9 +2728,69 @@ fn persist_current_account(current_account: &Account) {
         println!("Failed to persist current account: {e}");
     }
 }
+/// Loader kind of an installed version, detected from the version json
+/// CONTENT (mainClass/libraries), never from the folder name: folder names
+/// are user-chosen since renames, while content always tells the truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionKind {
+    Vanilla,
+    Fabric,
+    NeoForge,
+    Forge,
+    UnknownModded,
+}
+pub fn version_kind(id: &str) -> VersionKind {
+    version_kind_at(&launcher::get_minecraft_dir(), id)
+}
+pub fn version_kind_at(mc_dir: &str, id: &str) -> VersionKind {
+    let path = format!("{mc_dir}/versions/{id}/{id}.json");
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return VersionKind::Vanilla,
+    };
+    let v: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return VersionKind::Vanilla,
+    };
+    if v["inheritsFrom"].as_str().is_none() {
+        return VersionKind::Vanilla;
+    }
+    let main = v["mainClass"].as_str().unwrap_or("").to_lowercase();
+    if main.contains("knot") {
+        return VersionKind::Fabric;
+    }
+    if main.contains("bootstraplauncher") {
+        // "neoforge" contains "forge": check neo first everywhere.
+        let libs: Vec<String> = v["libraries"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|l| l["name"].as_str().map(str::to_lowercase))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if id.to_lowercase().contains("neoforge")
+            || libs.iter().any(|l| l.contains("neoforged"))
+        {
+            return VersionKind::NeoForge;
+        }
+        return VersionKind::Forge;
+    }
+    // Odd profiles without a known mainClass: fall back to name markers.
+    let lower = id.to_lowercase();
+    if lower.contains("neoforge") {
+        VersionKind::NeoForge
+    } else if lower.contains("fabric") {
+        VersionKind::Fabric
+    } else if lower.contains("forge") {
+        VersionKind::Forge
+    } else {
+        VersionKind::UnknownModded
+    }
+}
 /// Human-readable description of an installed version, e.g.
-/// `Minecraft 1.21.1 • NeoForge 21.1.250`, so modded entries show
-/// which Minecraft version they are for.
+/// `Minecraft 1.21.1 • NeoForge`, so modded entries show which Minecraft
+/// version they are for. Loader comes from json content (rename-proof).
 fn describe_version(id: &str) -> String {
     if id.is_empty() {
         return String::new();
@@ -2609,15 +2810,11 @@ fn describe_version(id: &str) -> String {
         Err(_) => return String::new(),
     };
     if let Some(mc) = v["inheritsFrom"].as_str() {
-        // Check "neoforge" before "forge": the former contains the latter.
-        let loader = if id.contains("neoforge") {
-            format!("NeoForge {}", id.trim_start_matches("neoforge-"))
-        } else if id.contains("fabric") {
-            "Fabric".to_string()
-        } else if id.contains("forge") {
-            "Forge".to_string()
-        } else {
-            "Modded".to_string()
+        let loader = match version_kind(id) {
+            VersionKind::Fabric => "Fabric",
+            VersionKind::NeoForge => "NeoForge",
+            VersionKind::Forge => "Forge",
+            _ => "Modded",
         };
         format!("Minecraft {mc} \u{2022} {loader}")
     } else {
@@ -2812,6 +3009,17 @@ enum DownloaderState {
     Update(String),
     NeoForgeInstaller { mc_version: String, nf_version: String },
 }
+/// Version dir id for a finished version download. NB: the downloader
+/// stores the MC id, while Fabric lives in "{mc}-fabric".
+fn finished_version_dir_id(state: &DownloaderState) -> Option<String> {
+    match state {
+        DownloaderState::Downloading(version, version_type) => Some(match version_type {
+            downloader::VersionType::Vanilla => version.clone(),
+            downloader::VersionType::Fabric { .. } => format!("{version}-fabric"),
+        }),
+        _ => None,
+    }
+}
 impl Default for Downloader {
     fn default() -> Self {
         Downloader {
@@ -2924,12 +3132,83 @@ fn sanitize_instance_name(version: &str) -> String {
 /// Isolated game directory for a version:
 /// `{minecraft_dir}/dgrlauncher_instances/<version>`.
 /// Shared files (versions, libraries, assets, java) stay in `.minecraft`.
-fn game_instance_dir_for_version(version: &str) -> String {
+fn instance_dir_for(mc_dir: &str, version: &str) -> String {
     format!(
         "{}/dgrlauncher_instances/{}",
-        launcher::get_minecraft_dir(),
+        mc_dir,
         sanitize_instance_name(version)
     )
+}
+fn game_instance_dir_for_version(version: &str) -> String {
+    instance_dir_for(&launcher::get_minecraft_dir(), version)
+}
+/// Move an installed version (and its instance data) to a new user-chosen
+/// name. Pure filesystem work, no launcher state: the result is verified,
+/// and any failure rolls the version dir back, so a half-rename never
+/// stays on disk. Profile bytes are moved untouched (no "id" patching),
+/// so javaVersion/inheritsFrom/libraries can never be corrupted.
+/// Name rules shared by rename and custom install names.
+pub fn valid_new_instance_name(mc_dir: &str, new: &str) -> Result<(), String> {
+    if new.is_empty() || new == "." || new == ".." || new.contains('/') || new.contains('\\')
+    {
+        return Err(String::from("Invalid name."));
+    }
+    if Path::new(&format!("{mc_dir}/versions/{new}")).exists() {
+        return Err(String::from(
+            "A version with this name already exists.",
+        ));
+    }
+    Ok(())
+}
+pub fn rename_instance(mc_dir: &str, old: &str, new: &str) -> Result<(), String> {
+    valid_new_instance_name(mc_dir, new)?;
+    if new == old {
+        return Err(String::from("Same name, nothing to do."));
+    }
+    let rollback_dir = || {
+        let _ = fs::rename(
+            format!("{mc_dir}/versions/{new}"),
+            format!("{mc_dir}/versions/{old}"),
+        );
+    };
+    // 1. Version dir (authoritative for launch).
+    fs::rename(
+        format!("{mc_dir}/versions/{old}"),
+        format!("{mc_dir}/versions/{new}"),
+    )
+    .map_err(|e| format!("Rename failed: {e}"))?;
+    // 2. Inner files follow the folder name.
+    for ext in ["json", "jar"] {
+        let from = format!("{mc_dir}/versions/{new}/{old}.{ext}");
+        if Path::new(&from).exists() {
+            if let Err(e) = fs::rename(&from, format!("{mc_dir}/versions/{new}/{new}.{ext}"))
+            {
+                rollback_dir();
+                return Err(format!("Rename failed: {e}"));
+            }
+        }
+    }
+    // 3. Verify the version is still readable, else roll back.
+    let readable = fs::read_to_string(format!("{mc_dir}/versions/{new}/{new}.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .is_some();
+    if !readable {
+        rollback_dir();
+        return Err(String::from(
+            "Version files unreadable after rename, rolled back.",
+        ));
+    }
+    // 4. Instance data dir (worlds, mods, configs move along). On failure
+    // the version move above is rolled back too: no half-renames.
+    let old_inst = instance_dir_for(mc_dir, old);
+    if Path::new(&old_inst).exists() {
+        if let Err(e) = fs::rename(&old_inst, instance_dir_for(mc_dir, new)) {
+            rollback_dir();
+            return Err(format!("Instance folder failed, rolled back: {e}"));
+        }
+    }
+    Ok(())
 }
 fn is_file_empty(file_path: &str) -> bool {
     let mut file = File::open(file_path).unwrap();
@@ -2980,5 +3259,158 @@ fn backward_compatibility_measures() {
             &new_game_instances_path,
             "legacy minelander_profiles folder",
         );
+    }
+}
+#[cfg(test)]
+mod instance_rename_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const VANILLA_JSON: &str = r#"{
+        "id": "1.21.1",
+        "javaVersion": { "majorVersion": 21 },
+        "mainClass": "net.minecraft.client.main.Main"
+    }"#;
+    const FABRIC_JSON: &str = r#"{
+        "id": "fabric-loader-0.16.14-1.21.1",
+        "inheritsFrom": "1.21.1",
+        "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+        "libraries": []
+    }"#;
+    const NEOFORGE_JSON: &str = r#"{
+        "id": "neoforge-21.1.213",
+        "inheritsFrom": "1.21.1",
+        "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+        "libraries": [{ "name": "net.neoforged:neoforge:21.1.213" }]
+    }"#;
+
+    fn test_root(case: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dgr_rename_{}_{}",
+            std::process::id(),
+            case
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("versions")).unwrap();
+        dir
+    }
+
+    fn put_version(mc: &Path, name: &str, json: &str, jar: bool) {
+        let dir = mc.join("versions").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{name}.json")), json).unwrap();
+        if jar {
+            fs::write(dir.join(format!("{name}.jar")), b"JARBYTES").unwrap();
+        }
+    }
+
+    fn mc_str(root: &Path) -> String {
+        root.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn vanilla_rename_moves_files_untouched() {
+        let root = test_root("vanilla");
+        let mc = mc_str(&root);
+        put_version(&root, "1.21.1", VANILLA_JSON, true);
+        rename_instance(&mc, "1.21.1", "My Vanilla").unwrap();
+        assert!(!root.join("versions/1.21.1").exists());
+        let json =
+            fs::read_to_string(root.join("versions/My Vanilla/My Vanilla.json")).unwrap();
+        assert_eq!(json, VANILLA_JSON);
+        assert_eq!(
+            fs::read(root.join("versions/My Vanilla/My Vanilla.jar")).unwrap(),
+            b"JARBYTES"
+        );
+        assert_eq!(version_kind_at(&mc, "My Vanilla"), VersionKind::Vanilla);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fabric_rename_keeps_loader_and_vanilla_copy() {
+        let root = test_root("fabric");
+        let mc = mc_str(&root);
+        // Loader profile as saved by the installer ({mc}-fabric.json)...
+        put_version(&root, "1.21.1-fabric", FABRIC_JSON, true);
+        // ...plus the vanilla copy inside the same dir.
+        fs::write(
+            root.join("versions/1.21.1-fabric/1.21.1.json"),
+            VANILLA_JSON,
+        )
+        .unwrap();
+        rename_instance(&mc, "1.21.1-fabric", "My Pack").unwrap();
+        // Loader detection must survive custom names (content, not name).
+        assert_eq!(version_kind_at(&mc, "My Pack"), VersionKind::Fabric);
+        // Profile bytes untouched (no "id" patching).
+        let json =
+            fs::read_to_string(root.join("versions/My Pack/My Pack.json")).unwrap();
+        assert_eq!(json, FABRIC_JSON);
+        // Vanilla copy keeps its own name.
+        assert!(root.join("versions/My Pack/1.21.1.json").exists());
+        assert!(root.join("versions/My Pack/My Pack.jar").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn neoforge_rename_keeps_loader() {
+        let root = test_root("neoforge");
+        let mc = mc_str(&root);
+        put_version(&root, "neoforge-21.1.213", NEOFORGE_JSON, false);
+        rename_instance(&mc, "neoforge-21.1.213", "My Forge Pack").unwrap();
+        assert_eq!(
+            version_kind_at(&mc, "My Forge Pack"),
+            VersionKind::NeoForge
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_collision_and_invalid_fail_unchanged() {
+        let root = test_root("collision");
+        let mc = mc_str(&root);
+        put_version(&root, "1.21.1", VANILLA_JSON, false);
+        put_version(&root, "taken", VANILLA_JSON, false);
+        assert!(rename_instance(&mc, "1.21.1", "taken").is_err());
+        assert!(rename_instance(&mc, "1.21.1", "../evil").is_err());
+        assert!(rename_instance(&mc, "1.21.1", "").is_err());
+        assert!(root.join("versions/1.21.1/1.21.1.json").exists());
+        assert!(!root.join("versions/taken/../evil").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finished_dir_id_maps_fabric() {
+        assert_eq!(
+            finished_version_dir_id(&DownloaderState::Downloading(
+                String::from("1.21.1"),
+                downloader::VersionType::Vanilla
+            )),
+            Some(String::from("1.21.1"))
+        );
+        assert_eq!(
+            finished_version_dir_id(&DownloaderState::Downloading(
+                String::from("1.21.1"),
+                downloader::VersionType::Fabric {
+                    loader: String::from("0.16.14"),
+                }
+            )),
+            Some(String::from("1.21.1-fabric"))
+        );
+        assert_eq!(finished_version_dir_id(&DownloaderState::Idle), None);
+    }
+
+    #[test]
+    fn rename_without_json_rolls_back() {
+        let root = test_root("rollback");
+        let mc = mc_str(&root);
+        // Dir with a jar but no version json: rename must refuse and the
+        // old dir must be back in place afterwards.
+        let dir = root.join("versions/broken");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("broken.jar"), b"JARBYTES").unwrap();
+        assert!(rename_instance(&mc, "broken", "renamed").is_err());
+        assert!(root.join("versions/broken").exists());
+        assert!(!root.join("versions/renamed").exists());
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -805,7 +805,17 @@ fn automatic_java(p: Value, game_version: &String, ismodded: bool) -> (String, V
     } else {
         &p
     };
-    let required = required_java_major(lookup_ref, game_version);
+    // Custom folder names must never reach the fallback table: for modded
+    // versions the vanilla id (inheritsFrom) is the fallback reference.
+    let fallback_id = if ismodded {
+        p["inheritsFrom"]
+            .as_str()
+            .unwrap_or(game_version)
+            .to_owned()
+    } else {
+        game_version.clone()
+    };
+    let required = required_java_major(lookup_ref, &fallback_id);
     let binary = if std::env::consts::OS == "windows" {
         "javaw.exe"
     } else {

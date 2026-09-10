@@ -1,6 +1,6 @@
 [package]
 name = "dgrlauncher"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 authors = ["VLAZOF"]
 repository = "https://github.com/VLAZOF/dgrlauncher"
@@ -20,10 +20,10 @@ sha2 = "0.10"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
-open = "5.4.3"
+open = "5.4.4"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-uuid = { version = "1.26.0", default-features = false, features = ["v4", "std"] }
+uuid = { version = "1.26.1", default-features = false, features = ["v4", "std"] }
 md5 = "0.8.1"
 shared_child = "1.1.2"
 tar = { version = "0.4.46", default-features = false }
