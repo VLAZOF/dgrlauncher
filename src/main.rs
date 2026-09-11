@@ -152,6 +152,10 @@ struct DgrLauncher {
     /// Dependency section state on the mod page.
     modstore_deps_expanded: bool,
     modstore_dep_titles: HashMap<String, (String, String)>,
+    /// Which project the loaded `modstore_versions` belong to. The list
+    /// survives navigation, so the update-entry refresh must never use a
+    /// stale list of ANOTHER mod (it would offer A's version to B).
+    modstore_versions_project: Option<String>,
     /// Installed mods of the current instance (`project_id -> entry`).
     modstore_installed: HashMap<String, modrinth::InstalledMod>,
     /// Armed mod delete confirmation (`project_id`), same two-click pattern
@@ -644,6 +648,24 @@ impl DgrLauncher {
             Message::ClearNotices,
         )
     }
+    /// Refresh the update entry after an install. Only the version list of
+    /// the SAME project may be used: a stale page list of another mod must
+    /// never leak into this project's entry (it would offer A's version
+    /// to B with an icon that never disappears).
+    fn refreshed_update_entry(
+        versions_project: Option<&str>,
+        versions: &[modrinth::ModVersion],
+        loader: &str,
+        mc: &str,
+        entry: &modrinth::InstalledMod,
+    ) -> Option<modrinth::ModVersion> {
+        if versions_project != Some(entry.project_id.as_str()) {
+            return None;
+        }
+        modrinth::latest_compatible(versions, loader, mc)
+            .filter(|v| v.id != entry.version_id)
+            .cloned()
+    }
     /// Scroll the catalog back to the saved offset.
     fn restore_store_scroll(y: f32) -> Task<Message> {
         iced_runtime::task::widget(
@@ -839,6 +861,7 @@ impl DgrLauncher {
                 state.modstore_results = Vec::new();
                 state.modstore_detail = None;
                 state.modstore_versions = Vec::new();
+                state.modstore_versions_project = None;
                 state.modstore_tab = ModStoreTab::Store;
                 state.modstore_downloading = false;
                 state.modstore_delete_confirm = None;
@@ -964,6 +987,7 @@ impl DgrLauncher {
                 state.screen = Screen::ModPage;
                 state.modstore_detail = None;
                 state.modstore_versions = Vec::new();
+                state.modstore_versions_project = None;
                 state.modstore_downloading = false;
                 state.modstore_delete_confirm = None;
                 state.modstore_hovered_version = None;
@@ -977,6 +1001,7 @@ impl DgrLauncher {
                         state.modstore_status = String::new();
                         state.modstore_detail = Some(detail.clone());
                         state.modstore_versions = versions;
+                        state.modstore_versions_project = Some(detail.id.clone());
                         let mut tasks = Vec::new();
                         if !detail.icon_url.is_empty()
                             && !state.modstore_icons.contains_key(&detail.icon_url)
@@ -1177,28 +1202,27 @@ impl DgrLauncher {
                         {
                             state.modstore_update_confirm = None;
                         }
-                        // Refresh the update entry from the loaded page list
-                        // when available; otherwise drop it (rechecked later).
-                        if state.modstore_versions.is_empty() {
-                            state.modstore_updates.remove(&entry.project_id);
-                        } else {
-                            let (mc, loader) =
-                                modrinth::instance_loader(&state.current_version)
-                                    .unwrap_or_default();
-                            match modrinth::latest_compatible(
-                                &state.modstore_versions,
-                                &loader,
-                                &mc,
-                            ) {
-                                Some(latest) if latest.id != entry.version_id => {
-                                    state.modstore_updates.insert(
-                                        entry.project_id.clone(),
-                                        latest.clone(),
-                                    );
-                                }
-                                _ => {
-                                    state.modstore_updates.remove(&entry.project_id);
-                                }
+                        // Refresh the update entry, but ONLY from the version
+                        // list of this same project (see helper): a stale
+                        // list of another mod must never leak in. Otherwise
+                        // drop it, the next auto/manual check rebuilds it.
+                        let (mc, loader) =
+                            modrinth::instance_loader(&state.current_version)
+                                .unwrap_or_default();
+                        match refreshed_update_entry(
+                            state.modstore_versions_project.as_deref(),
+                            &state.modstore_versions,
+                            &loader,
+                            &mc,
+                            &entry,
+                        ) {
+                            Some(latest) => {
+                                state
+                                    .modstore_updates
+                                    .insert(entry.project_id.clone(), latest);
+                            }
+                            None => {
+                                state.modstore_updates.remove(&entry.project_id);
                             }
                         }
                     }
@@ -1329,6 +1353,7 @@ impl DgrLauncher {
                     state.screen = Screen::ModPage;
                     state.modstore_detail = None;
                     state.modstore_versions = Vec::new();
+                    state.modstore_versions_project = None;
                     state.modstore_downloading = false;
                     state.modstore_delete_confirm = None;
                     state.modstore_hovered_version = None;
@@ -3397,6 +3422,76 @@ mod instance_rename_tests {
             Some(String::from("1.21.1-fabric"))
         );
         assert_eq!(finished_version_dir_id(&DownloaderState::Idle), None);
+    }
+
+    #[test]
+    fn update_entry_never_uses_another_projects_list() {
+        // Regression: updating mod A and then mod B offered A's version
+        // to B (with a stuck update icon), because the stale page list
+        // of A was reused for B's entry.
+        let ver = |id: &str, num: &str| modrinth::ModVersion {
+            id: id.to_owned(),
+            version_number: num.to_owned(),
+            loaders: vec![String::from("fabric")],
+            game_versions: vec![String::from("1.21.1")],
+            ..Default::default()
+        };
+        let installed_b = modrinth::InstalledMod {
+            project_id: String::from("B"),
+            slug: String::from("mod-b"),
+            title: String::from("Mod B"),
+            icon_url: String::new(),
+            version_id: String::from("b1"),
+            version_number: String::from("1.0"),
+            filename: String::from("mod-b-1.0.jar"),
+        };
+        let a_list = vec![ver("a2", "2.0"), ver("a1", "1.0")];
+        // B just installed, but the loaded list belongs to A -> drop entry.
+        assert!(
+            refreshed_update_entry(
+                Some("A"),
+                &a_list,
+                "fabric",
+                "1.21.1",
+                &installed_b
+            )
+            .is_none()
+        );
+        // Same project, newer compatible first -> offer it.
+        let installed_a = modrinth::InstalledMod {
+            project_id: String::from("A"),
+            version_id: String::from("a1"),
+            ..installed_b.clone()
+        };
+        let offered =
+            refreshed_update_entry(Some("A"), &a_list, "fabric", "1.21.1", &installed_a);
+        assert_eq!(offered.map(|v| v.id), Some(String::from("a2")));
+        // Already at latest -> no entry.
+        let installed_a2 = modrinth::InstalledMod {
+            version_id: String::from("a2"),
+            ..installed_a.clone()
+        };
+        assert!(
+            refreshed_update_entry(
+                Some("A"),
+                &a_list,
+                "fabric",
+                "1.21.1",
+                &installed_a2
+            )
+            .is_none()
+        );
+        // Same project, but nothing compatible (other loader) -> no entry.
+        assert!(
+            refreshed_update_entry(
+                Some("A"),
+                &a_list,
+                "neoforge",
+                "1.21.1",
+                &installed_a
+            )
+            .is_none()
+        );
     }
 
     #[test]
