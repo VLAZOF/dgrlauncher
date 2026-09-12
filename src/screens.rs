@@ -1,8 +1,8 @@
 use iced::{
     alignment,
     widget::{
-        button, column, container, mouse_area, pick_list, row, scrollable, slider, svg, text,
-        text_input, toggler, tooltip, Column, Row,
+        button, column, container, mouse_area, pick_list, progress_bar, row,
+        scrollable, slider, svg, text, text_input, toggler, tooltip, Column, Row,
     },
     Alignment, Length,
 };
@@ -76,6 +76,80 @@ fn ram_controls<'a>(
     .align_y(Alignment::Center)
 }
 
+/// 0..=100 progress value, total-guarded.
+fn pct(done: u64, total: u64) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        ((done as f32 / total as f32) * 100.0).clamp(0.0, 100.0)
+    }
+}
+
+/// Slim determinate bar, hidden when there is nothing to show.
+fn dl_bar(done: u64, total: u64, height: f32) -> Element<'static, Message> {
+    progress_bar(0.0..=100.0, pct(done, total))
+        .length(Length::Fill)
+        .girth(Length::Fixed(height))
+        .into()
+}
+
+/// Active downloads block for the main screen (`None` when idle):
+/// one row per downloader, determinate bar where numbers exist.
+fn downloads_block<'a>(
+    app: &'a super::DgrLauncher,
+) -> Option<Column<'a, Message, super::theme::Theme, Renderer>> {
+    use super::downloader::VersionType;
+    use super::DownloaderState;
+    if app.downloaders.is_empty() {
+        return None;
+    }
+    let mut list = column![text(t!("main.downloads_title")).size(14)].spacing(6);
+    for d in &app.downloaders {
+        let label: String = match &d.state {
+            DownloaderState::Downloading(v, VersionType::Fabric { .. }) => {
+                format!("{v}-fabric")
+            }
+            DownloaderState::Downloading(v, _) => v.clone(),
+            DownloaderState::JavaDownloading(_) => t!("main.dl_java").to_string(),
+            DownloaderState::DownloadingMissingFiles(_) => {
+                t!("main.dl_missing").to_string()
+            }
+            DownloaderState::Update(_) => t!("main.dl_update").to_string(),
+            DownloaderState::NeoForgeInstaller { nf_version, .. } => {
+                format!("neoforge-{nf_version}")
+            }
+            DownloaderState::Idle => continue,
+        };
+        let mut row_col = column![text(label).size(12)].spacing(2);
+        let bar: Option<Element<'a, Message>> = match &d.state {
+            DownloaderState::Downloading(..) if app.files_download_number > 0 => {
+                Some(dl_bar(
+                    app.files_downloaded.max(0) as u64,
+                    app.files_download_number.max(0) as u64,
+                    8.,
+                ))
+            }
+            DownloaderState::JavaDownloading(_) if app.java_download_size > 0 => {
+                Some(dl_bar(
+                    app.java_downloaded as u64,
+                    app.java_download_size as u64,
+                    8.,
+                ))
+            }
+            DownloaderState::Update(_) if app.update_total > 0 => Some(dl_bar(
+                app.update_downloaded as u64,
+                app.update_total as u64,
+                8.,
+            )),
+            _ => None,
+        };
+        if let Some(bar) = bar {
+            row_col = row_col.push(bar);
+        }
+        list = list.push(row_col);
+    }
+    Some(list)
+}
 /// One-line description: single line, capped length.
 fn short_desc(s: &str, max: usize) -> String {
     let one_line = s
@@ -92,43 +166,89 @@ fn short_desc(s: &str, max: usize) -> String {
     }
 }
 
-/// Per-instance icon from its config: cube (default), star, heart or
-/// a letter avatar. Falls back to cube.
-/// Nothing is borrowed: icons are static bytes and labels are owned,
-// so the result is `'static` and never ties temporaries to the view.
-fn instance_icon(icon: &str, title: &str, size: f32) -> Element<'static, Message> {
-    let icon_svg = |name: &str| {
-        let bytes: &'static [u8] = match name {
-            "star" => include_bytes!("icons/star.svg").as_slice(),
-            "heart" => include_bytes!("icons/heart.svg").as_slice(),
-            _ => include_bytes!("icons/cube.svg").as_slice(),
-        };
-        svg(svg::Handle::from_memory(bytes))
+/// Default instance icon (cube). Custom uploads (if any) live in
+/// `app.instance_icons` and are rendered at the call site.
+fn default_instance_icon(size: f32) -> Element<'static, Message> {
+    svg(svg::Handle::from_memory(
+        include_bytes!("icons/cube.svg").as_slice(),
+    ))
+    .width(size)
+    .height(size)
+    .into()
+}
+
+/// Instance icon for a version: custom upload when present, cube fallback.
+fn version_icon<'a>(
+    icons: &'a HashMap<String, iced::widget::image::Handle>,
+    version: &'a str,
+    size: f32,
+) -> Element<'a, Message> {
+    if let Some(handle) = icons.get(version) {
+        return iced::widget::image::Image::new(handle.clone())
             .width(size)
             .height(size)
+            .into();
+    }
+    default_instance_icon(size)
+}
+
+/// Icon picker button: current preview or an empty-image placeholder.
+/// Clicking opens the file dialog.
+fn icon_picker(
+    preview: Option<iced::widget::image::Handle>,
+    on_pick: Message,
+) -> Element<'static, Message> {
+    let content: Element<'static, Message> = match preview {
+        Some(handle) => iced::widget::image::Image::new(handle)
+            .width(56)
+            .height(56)
+            .into(),
+        None => container(
+            svg(svg::Handle::from_memory(
+                include_bytes!("icons/plus.svg").as_slice(),
+            ))
+            .width(24)
+            .height(24),
+        )
+        .style(theme::black_container)
+        .width(Length::Fixed(56.))
+        .height(Length::Fixed(56.))
+        .align_x(alignment::Horizontal::Center)
+        .align_y(alignment::Vertical::Center)
+        .into(),
     };
-    match icon {
-        "star" | "heart" => icon_svg(icon).into(),
-        "letter" => {
-            let letter = title
-                .chars()
-                .next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or_else(|| String::from("?"));
-            container(
-                text(letter)
-                    .size(size * 0.55)
-                    .align_x(alignment::Horizontal::Center)
-                    .align_y(alignment::Vertical::Center),
-            )
-            .style(theme::black_container)
-            .width(Length::Fixed(size))
-            .height(Length::Fixed(size))
-            .align_x(alignment::Horizontal::Center)
-            .align_y(alignment::Vertical::Center)
+    button(content)
+        .on_press(on_pick)
+        .style(theme::primary_button)
+        .padding(4)
+        .into()
+}
+
+/// Two-click delete button: armed shows "Sure?", otherwise a trash icon.
+fn delete_button(
+    armed: bool,
+    on_delete: Message,
+    icon: f32,
+    padding: u16,
+) -> Element<'static, Message> {
+    if armed {
+        button(text(t!("common.sure")).size(12))
+            .on_press(on_delete)
+            .style(theme::red_button)
+            .padding(padding)
             .into()
-        }
-        _ => icon_svg("cube").into(),
+    } else {
+        button(
+            svg(svg::Handle::from_memory(
+                include_bytes!("icons/trash.svg").as_slice(),
+            ))
+            .width(icon)
+            .height(icon),
+        )
+        .on_press(on_delete)
+        .style(theme::red_button)
+        .padding(padding)
+        .into()
     }
 }
 
@@ -209,10 +329,8 @@ pub fn get_screen_content<'a>(
                     let mut list = column![].spacing(8);
                     for v in &app.all_versions {
                         let selected = *v == app.current_version;
-                        let icon_name =
-                            super::read_instance_config(v).icon.unwrap_or_default();
                         let row_content = row![
-                            instance_icon(&icon_name, v, 24.),
+                            version_icon(&app.instance_icons, v, 24.),
                             column![
                                 text(v.clone()).size(15),
                                 text(super::describe_version(v))
@@ -235,23 +353,12 @@ pub fn get_screen_content<'a>(
                         // first click arms ("Sure?"), second click deletes.
                         if selected {
                             let armed = app.delete_confirm.as_deref() == Some(v);
-                            let delete_button = if armed {
-                                button(text(t!("common.sure")).size(12))
-                                    .on_press(Message::DeleteInstancePressed(v.clone()))
-                                    .style(theme::red_button)
-                                    .padding(8)
-                            } else {
-                                button(
-                                    svg(svg::Handle::from_memory(
-                                        include_bytes!("icons/trash.svg").as_slice(),
-                                    ))
-                                    .width(16)
-                                    .height(16),
-                                )
-                                .on_press(Message::DeleteInstancePressed(v.clone()))
-                                .style(theme::red_button)
-                                .padding(8)
-                            };
+                            let delete_button = delete_button(
+                                armed,
+                                Message::DeleteInstancePressed(v.clone()),
+                                16.,
+                                8,
+                            );
                             instance_row = instance_row.push(delete_button);
                         }
                         list = list.push(instance_row);
@@ -322,6 +429,13 @@ pub fn get_screen_content<'a>(
                 .align_y(Alignment::Center),
             ]
             .spacing(4);
+            if app.java_download_size > 0 {
+                info_column = info_column.push(dl_bar(
+                    app.java_downloaded as u64,
+                    app.java_download_size as u64,
+                    8.,
+                ));
+            }
             if has_selection {
                 info_column = info_column.push(text(t!(
                     "main.mods_count",
@@ -365,7 +479,7 @@ pub fn get_screen_content<'a>(
                 .width(Length::Fixed(64.))
                 .height(Length::Fixed(64.))
                 .style(theme::round_play_button)
-                .on_press_maybe(if has_selection {
+                .on_press_maybe(if has_selection && app.downloaders.is_empty() {
                     Some(Message::Launch)
                 } else {
                     None
@@ -425,10 +539,16 @@ pub fn get_screen_content<'a>(
             let bottom = row![info_box, controls]
                 .spacing(10)
                 .align_y(Alignment::End);
-            let mut main = column![header, list_area, bottom]
+            let mut main = column![header, list_area]
                 .spacing(12)
                 .width(Length::Fill)
                 .height(Length::Fill);
+            // Active downloads sit between the list and the bottom
+            // panel; Play stays locked until they finish.
+            if let Some(block) = downloads_block(app) {
+                main = main.push(block);
+            }
+            main = main.push(bottom);
             if app.accounts.is_empty() {
                 main = main.push(
                     text(t!("main.no_accounts"))
@@ -448,6 +568,29 @@ pub fn get_screen_content<'a>(
                 .to_string()
             } else {
                 app.last_version.clone()
+            };
+            let notes: Element<'_, Message> =
+                if app.update_available && !app.update_notes.is_empty() {
+                    column![
+                        text(t!("settings.whats_new")).size(13),
+                        container(
+                            scrollable(text(&app.update_notes).size(12))
+                                .width(Length::Fill)
+                                .height(120.)
+                        )
+                        .style(theme::black_container)
+                        .padding(8)
+                        .width(Length::Fill),
+                    ]
+                    .spacing(6)
+                    .into()
+                } else {
+                    row![].into()
+                };
+            let update_bar: Element<'_, Message> = if app.update_total > 0 {
+                dl_bar(app.update_downloaded as u64, app.update_total as u64, 10.)
+            } else {
+                row![].into()
             };
             column![
                 text(t!("settings.title")).size(30),
@@ -504,6 +647,13 @@ pub fn get_screen_content<'a>(
                         .spacing(10),
                         text(t!("settings.other")).size(20),
                         row![
+                            toggler(app.minimize_on_launch).on_toggle(Message::MinimizeToggled)
+                            .width(Length::Shrink),
+                            text(t!("settings.minimize"))
+                                .align_x(alignment::Horizontal::Center)
+                        ]
+                        .spacing(10),
+                        row![
                             text(update_line).size(13).width(Length::Fill),
                             tooltip(
                                 button(svg(svg::Handle::from_memory(
@@ -545,6 +695,8 @@ pub fn get_screen_content<'a>(
                         .spacing(10)
                         .align_y(Alignment::Center),
                         text(&app.update_text).size(12),
+                        update_bar,
+                        notes,
                     ]
                     .spacing(12)
                 )
@@ -642,21 +794,40 @@ pub fn get_screen_content<'a>(
             .height(40)
             .on_press(Message::InstallPressed)
             .style(theme::secondary_button);
+            let install_bar: Element<'_, Message> = if app.files_download_number > 0
+            {
+                dl_bar(
+                    app.files_downloaded.max(0) as u64,
+                    app.files_download_number.max(0) as u64,
+                    10.,
+                )
+            } else {
+                row![].into()
+            };
             column![
                 text(t!("install.title")).size(50),
                 container(
                     column![
+                        row![
+                            icon_picker(
+                                app.install_icon
+                                    .as_ref()
+                                    .map(|(handle, _, _)| handle.clone()),
+                                Message::PickInstallIcon,
+                            ),
+                            text_input(
+                                crate::tr!("install.name_placeholder"),
+                                &app.install_name
+                            )
+                            .on_input(Message::InstallNameChanged)
+                            .size(14)
+                            .width(Length::Fill),
+                        ]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
                         text(t!("install.mc_label")).size(20),
                         mc_pick_list,
                         loader_column,
-                        text(t!("install.name_label")).size(14),
-                        text_input(
-                            crate::tr!("install.name_placeholder"),
-                            &app.install_name
-                        )
-                        .on_input(Message::InstallNameChanged)
-                        .size(14)
-                        .width(250),
                         install_button,
                     ]
                     .spacing(15)
@@ -670,7 +841,8 @@ pub fn get_screen_content<'a>(
                         .align_x(alignment::Horizontal::Center)
                 ]
                 .spacing(10),
-                text(&app.download_text).size(15)
+                text(&app.download_text).size(15),
+                install_bar,
             ]
             .spacing(15)
             .max_width(800)
@@ -771,12 +943,17 @@ pub fn get_screen_content<'a>(
                     t!("accounts.type_local")
                 };
                 let text_content = format!("{} ({})", i.username, account_type);
-                let delete_button = button(svg(svg::Handle::from_memory(
-                    include_bytes!("icons/trash.svg").as_slice(),
-                )))
+                let delete_button = button(
+                    svg(svg::Handle::from_memory(
+                        include_bytes!("icons/trash.svg").as_slice(),
+                    ))
+                    .width(16)
+                    .height(16),
+                )
                 .width(30)
                 .height(30)
                 .style(theme::red_button)
+                .padding(7)
                 .on_press(Message::RemoveAccount(i.username.clone()));
                 accounts_column =
                     accounts_column.push(row![text(text_content), delete_button].spacing(10));
@@ -857,33 +1034,6 @@ pub fn get_screen_content<'a>(
             ]
             .spacing(10)
             .align_y(Alignment::Center);
-            // Icon presets: "" = default cube.
-            let current_icon = cfg.icon.clone().unwrap_or_default();
-            let mut icon_row = row![text(t!("instance.icon")).size(14)].spacing(10);
-            for preset in super::instance_icon_presets() {
-                let label = if preset.is_empty() {
-                    String::from("cube")
-                } else {
-                    preset.clone()
-                };
-                icon_row = icon_row.push(
-                    button(
-                        row![
-                            instance_icon(&label, "A", 20.),
-                            text(label).size(12),
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
-                    )
-                    .on_press(Message::InstanceIconChanged(preset.clone()))
-                    .style(if current_icon == preset {
-                        theme::secondary_button
-                    } else {
-                        theme::primary_button
-                    })
-                    .padding(6),
-                );
-            }
             // Loader switch block depends on the instance kind.
             let loader_block: Column<'a, Message, super::theme::Theme, Renderer> =
                 if crate::version_kind(&app.current_version) == crate::VersionKind::Fabric {
@@ -954,8 +1104,11 @@ pub fn get_screen_content<'a>(
                     .spacing(8)
                 };
             let content = column![
-                text(t!("instance.name_label")).size(15),
                 row![
+                    icon_picker(
+                        app.instance_icons.get(&app.current_version).cloned(),
+                        Message::PickInstanceIcon,
+                    ),
                     text_input(crate::tr!("instance.name_ph"), &app.instance_name_edit)
                         .on_input(Message::InstanceNameChanged)
                         .on_submit(Message::InstanceRenamePressed)
@@ -967,8 +1120,7 @@ pub fn get_screen_content<'a>(
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),
-                icon_row,
-                text(t!("instance.memory", ram = format!("{:.1}", app.game_ram))).size(15),
+                text(t!("instance.memory")).size(15),
                 ram_controls(
                     eff_ram,
                     &app.instance_ram_text,
@@ -993,16 +1145,19 @@ pub fn get_screen_content<'a>(
                 )
                 .width(250)
                 .text_size(14),
+                text(t!("instance.env_label")).size(15),
+                text_input(
+                    if app.game_enviroment_variables.is_empty() {
+                        crate::tr!("instance.env_unset")
+                    } else {
+                        &app.game_enviroment_variables
+                    },
+                    &app.instance_env_text,
+                )
+                .on_input(Message::InstanceEnvChanged)
+                .size(14)
+                .width(Length::Fill),
                 loader_block,
-                row![
-                    button(text(t!("instance.open_game")).size(12))
-                        .on_press(Message::OpenGameFolder)
-                        .padding(6),
-                    button(text(t!("instance.open_instance")).size(12))
-                        .on_press(Message::OpenGameInstanceFolder)
-                        .padding(6),
-                ]
-                .spacing(10),
                 text(&app.instance_settings_status)
                     .size(12)
                     .style(theme::peach_text),
@@ -1185,27 +1340,12 @@ pub fn get_screen_content<'a>(
                             {
                                 let armed = app.modstore_delete_confirm.as_deref()
                                     == Some(&e.project_id);
-                                let delete_button = if armed {
-                                    button(text(t!("common.sure")).size(12))
-                                        .on_press(Message::ModDeletePressed(
-                                            e.project_id.clone(),
-                                        ))
-                                        .style(theme::red_button)
-                                        .padding(8)
-                                } else {
-                                    button(
-                                        svg(svg::Handle::from_memory(
-                                            include_bytes!("icons/trash.svg").as_slice(),
-                                        ))
-                                        .width(16)
-                                        .height(16),
-                                    )
-                                    .on_press(Message::ModDeletePressed(
-                                        e.project_id.clone(),
-                                    ))
-                                    .style(theme::red_button)
-                                    .padding(8)
-                                };
+                                let delete_button = delete_button(
+                                    armed,
+                                    Message::ModDeletePressed(e.project_id.clone()),
+                                    16.,
+                                    8,
+                                );
                                 installed_row =
                                     installed_row.push(delete_button);
                             }
@@ -1271,25 +1411,12 @@ pub fn get_screen_content<'a>(
                                 let key = format!("file:{name}");
                                 let armed = app.modstore_delete_confirm.as_deref()
                                     == Some(&key);
-                                let delete_button = if armed {
-                                    button(text(t!("common.sure")).size(12))
-                                        .on_press(Message::ModLocalFileDelete(
-                                            name.clone(),
-                                        ))
-                                        .style(theme::red_button)
-                                        .padding(8)
-                                } else {
-                                    button(
-                                        svg(svg::Handle::from_memory(
-                                            include_bytes!("icons/trash.svg").as_slice(),
-                                        ))
-                                        .width(16)
-                                        .height(16),
-                                    )
-                                    .on_press(Message::ModLocalFileDelete(name.clone()))
-                                    .style(theme::red_button)
-                                    .padding(8)
-                                };
+                                let delete_button = delete_button(
+                                    armed,
+                                    Message::ModLocalFileDelete(name.clone()),
+                                    16.,
+                                    8,
+                                );
                                 list = list.push(
                                     row![
                                         column![
@@ -1496,28 +1623,12 @@ pub fn get_screen_content<'a>(
                                     == Some(&d.id);
                                 row![
                                     text("✓").size(14).style(theme::green_text),
-                                    if armed {
-                                        button(text(t!("common.sure")).size(12))
-                                            .on_press(Message::ModDeletePressed(
-                                                d.id.clone(),
-                                            ))
-                                            .style(theme::red_button)
-                                            .padding(6)
-                                    } else {
-                                        button(
-                                            svg(svg::Handle::from_memory(
-                                                include_bytes!("icons/trash.svg")
-                                                    .as_slice(),
-                                            ))
-                                            .width(14)
-                                            .height(14),
-                                        )
-                                        .on_press(Message::ModDeletePressed(
-                                            d.id.clone(),
-                                        ))
-                                        .style(theme::red_button)
-                                        .padding(6)
-                                    },
+                                    delete_button(
+                                        armed,
+                                        Message::ModDeletePressed(d.id.clone()),
+                                        14.,
+                                        6,
+                                    ),
                                 ]
                                 .spacing(8)
                                 .align_y(Alignment::Center)

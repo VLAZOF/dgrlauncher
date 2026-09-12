@@ -26,7 +26,7 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
         .unwrap_or(0);
     Some((major, minor, patch))
 }
-pub async fn check_launcher_updates() -> Result<(String, String), String> {
+pub async fn check_launcher_updates() -> Result<(String, String, String), String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -95,7 +95,10 @@ pub async fn check_launcher_updates() -> Result<(String, String), String> {
         }
     }
     match url {
-        Some(url) => Ok((url, latest_tag.to_string())),
+        Some(url) => {
+            let body = release["body"].as_str().unwrap_or("").to_owned();
+            Ok((url, latest_tag.to_string(), clean_release_notes(&body)))
+        }
         None => Err(t!(
             "upd.no_asset",
             os = env::consts::OS,
@@ -103,6 +106,16 @@ pub async fn check_launcher_updates() -> Result<(String, String), String> {
         )
         .to_string()),
     }
+}
+/// Release body for the Settings notes box: the auto-generated
+/// "Full Changelog" link line carries no info, drop it.
+fn clean_release_notes(body: &str) -> String {
+    body.lines()
+        .filter(|line| !line.trim_start().starts_with("**Full Changelog**"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
 }
 #[cfg(test)]
 mod tests {

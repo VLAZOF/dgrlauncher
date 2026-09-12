@@ -54,24 +54,31 @@ fn main() -> iced::Result {
             Err(e) => println!("Failed to delete old executable: {e}"),
         }
     }
+    let mut window_settings = window::Settings {
+        size: iced::Size {
+            width: 900.,
+            height: 535.,
+        },
+        min_size: Some(iced::Size {
+            width: 700.,
+            height: 400.,
+        }),
+        resizable: true,
+        icon: load_window_icon(),
+        exit_on_close_request: false,
+        ..window::Settings::default()
+    };
+    // Wayland app_id: without it the compositor (e.g. COSMIC panel)
+    // cannot identify or activate the window.
+    #[cfg(target_os = "linux")]
+    {
+        window_settings.platform_specific.application_id = String::from("dgrlauncher");
+    }
     iced::application(boot, update, view)
         .title(|state: &DgrLauncher| state.title())
         .subscription(subscription)
         .theme(|_state: &DgrLauncher| Theme)
-        .window(window::Settings {
-            size: iced::Size {
-                width: 900.,
-                height: 535.,
-            },
-            min_size: Some(iced::Size {
-                width: 700.,
-                height: 400.,
-            }),
-            resizable: true,
-            icon: load_window_icon(),
-            exit_on_close_request: false,
-            ..window::Settings::default()
-        })
+        .window(window_settings)
         .run()
 }
 #[derive(Default)]
@@ -107,6 +114,7 @@ struct DgrLauncher {
     pending_neoforge_install: Option<(String, String)>,
     download_text: String,
     files_download_number: i32,
+    files_downloaded: i32,
     needs_to_update_download_list: bool,
     detected_javas: Vec<system_java::SystemJava>,
     java_scan_status: String,
@@ -114,11 +122,16 @@ struct DgrLauncher {
     custom_java_flags: String,
     restrict_launch: bool,
     java_download_size: u8,
+    java_downloaded: u8,
     game_proccess: GameProcess,
     update_available: bool,
     last_version: String,
     update_url: String,
     update_text: String,
+    update_downloaded: u8,
+    update_total: u8,
+    /// Cleaned release body of the pending update (no Full Changelog).
+    update_notes: String,
     accounts: Vec<Account>,
     auth_code: auth::AuthCode,
     auth_token: auth::AuthToken,
@@ -172,6 +185,7 @@ struct DgrLauncher {
     /// Instance settings screen state.
     instance_name_edit: String,
     instance_ram_text: String,
+    instance_env_text: String,
     instance_settings_status: String,
     /// Loader switch state (fabric loaders or NeoForge versions for the base
     /// MC, selected/manual input, status). `pending_loader_switch` moves the
@@ -189,6 +203,18 @@ struct DgrLauncher {
     /// UI language code ("en" | "ru"). Set once in `boot()` from the
     /// config (auto-detected on first launch), changed in Settings.
     language: String,
+    /// Minimize the launcher window while the game runs.
+    minimize_on_launch: bool,
+    /// Main window id (captured on launch) for minimize/restore.
+    main_window: Option<window::Id>,
+    /// Whether the launcher minimized itself (only then it restores).
+    minimized_by_launcher: bool,
+    /// Custom icon preview + bytes picked on the Installation screen.
+    install_icon: Option<(iced::widget::image::Handle, Vec<u8>, String)>,
+    /// `(default version id, bytes, ext)` icons applied on install finish.
+    pending_install_icons: Vec<(String, Vec<u8>, String)>,
+    /// Loaded custom icons by version id.
+    instance_icons: HashMap<String, iced::widget::image::Handle>,
     /// `(default version id, custom name)` renames applied when each
     /// install finishes (validated at press, executed at finish).
     pending_install_names: Vec<(String, String)>,
@@ -205,12 +231,15 @@ struct Account {
 /// `{instance}/dgrlauncher_instance.json`. `None` = use the global setting.
 #[derive(Default, Serialize, Deserialize, Clone, Debug)]
 struct InstanceConfig {
-    /// "cube" (default) | "star" | "heart" | "letter".
-    icon: Option<String>,
+    /// Custom icon file inside the instance dir
+    /// (`dgrlauncher_icon.png`), `None` = default cube.
+    custom_icon: Option<String>,
     /// GiB override, `None` = global `game_ram`.
     ram: Option<f64>,
     /// "Automatic" | "System Java" | "Custom", `None` = global.
     java: Option<String>,
+    /// Env vars override (`KEY=val ...`), `None` = global setting.
+    env: Option<String>,
 }
 fn instance_config_path(version: &str) -> String {
     format!(
@@ -247,14 +276,110 @@ fn instance_base_mc(version_id: &str) -> String {
         .and_then(|v| v["inheritsFrom"].as_str().map(str::to_owned))
         .unwrap_or_else(|| version_id.to_owned())
 }
-/// Icon preset ids used by the instance settings ("" = default cube).
-fn instance_icon_presets() -> Vec<String> {
-    vec![
-        String::new(),
-        String::from("star"),
-        String::from("heart"),
-        String::from("letter"),
-    ]
+/// Custom icon file name for an instance dir.
+fn icon_file_name(ext: &str) -> String {
+    format!("dgrlauncher_icon.{ext}")
+}
+/// Read the custom icon bytes of an instance, if set and readable.
+fn read_instance_icon_bytes(version: &str) -> Option<Vec<u8>> {
+    let cfg = read_instance_config(version);
+    let file = cfg.custom_icon?;
+    let bytes =
+        std::fs::read(format!("{}/{}", game_instance_dir_for_version(version), file)).ok()?;
+    if bytes.len() > MAX_ICON_BYTES * 2 {
+        return None;
+    }
+    Some(bytes)
+}
+/// Save icon bytes into the instance dir and record the file in its config.
+/// A previous icon with another extension is removed.
+fn write_instance_icon(version: &str, bytes: &[u8], ext: &str) -> Result<(), String> {
+    let dir = game_instance_dir_for_version(version);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| t!("icon.save_failed", err = e.to_string()).to_string())?;
+    let mut cfg = read_instance_config(version);
+    let name = icon_file_name(ext);
+    if cfg.custom_icon.as_deref() != Some(&name)
+        && let Some(old) = &cfg.custom_icon
+    {
+        let _ = std::fs::remove_file(format!("{dir}/{old}"));
+    }
+    std::fs::write(format!("{dir}/{name}"), bytes)
+        .map_err(|e| t!("icon.save_failed", err = e.to_string()).to_string())?;
+    cfg.custom_icon = Some(name);
+    write_instance_config(version, &cfg)
+}
+/// Carry the current instance icon over to a loader-switch target:
+/// the freshly installed instance inherits the icon.
+fn carry_icon_to_target(state: &mut DgrLauncher, target: String) {
+    let current = state.current_version.clone();
+    let icon = read_instance_config(&current).custom_icon.and_then(|file| {
+        let ext = file.rsplit('.').next()?.to_owned();
+        let bytes = std::fs::read(format!(
+            "{}/{}",
+            game_instance_dir_for_version(&current),
+            file
+        ))
+        .ok()?;
+        Some((bytes, ext))
+    });
+    if let Some((bytes, ext)) = icon {
+        state
+            .pending_install_icons
+            .retain(|(o, _, _)| *o != target);
+        state.pending_install_icons.push((target, bytes, ext));
+    }
+}
+/// Max accepted icon file size (2 MB).
+const MAX_ICON_BYTES: usize = 2_000_000;
+/// Extension + magic bytes + size check for a picked icon file.
+fn validate_icon_bytes(bytes: &[u8], ext: &str) -> Result<(), String> {
+    if bytes.len() > MAX_ICON_BYTES {
+        return Err(t!("icon.too_big").to_string());
+    }
+    let png = bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let jpg = bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
+    let ok = match ext {
+        "png" => png,
+        "jpg" | "jpeg" => jpg,
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(t!("icon.bad_format").to_string())
+    }
+}
+/// Lowercased extension of a picked file name, if supported.
+fn icon_ext(file_name: &str) -> Option<String> {
+    let ext = file_name.rsplit('.').next()?.to_lowercase();
+    match ext.as_str() {
+        "png" => Some(String::from("png")),
+        "jpg" | "jpeg" => Some(String::from("jpg")),
+        _ => None,
+    }
+}
+/// Native image picker (PNG + JPG). `None` = user cancelled.
+async fn pick_icon_file() -> Result<Option<(Vec<u8>, String)>, String> {
+    let picked = rfd::AsyncFileDialog::new()
+        .add_filter("Images", &["png", "jpg", "jpeg"])
+        .set_title(t!("icon.pick_title"))
+        .pick_file()
+        .await;
+    match picked {
+        None => Ok(None),
+        Some(handle) => {
+            let name = handle.file_name();
+            let ext = icon_ext(&name).ok_or_else(|| t!("icon.bad_format").to_string())?;
+            let bytes = handle.read().await;
+            if bytes.is_empty() {
+                return Err(t!("icon.read_failed").to_string());
+            }
+            validate_icon_bytes(&bytes, &ext)?;
+            // Normalize jpeg -> jpg for a single stored file name.
+            Ok(Some((bytes, ext)))
+        }
+    }
 }
 
 /// Mod store tab: catalog from Modrinth vs locally installed mods.
@@ -322,21 +447,27 @@ enum Message {
     InstallPressed,
     ManageDownload((usize, downloader::Progress)),
     VanillaJson(Value),
-    OpenGameFolder,
-    OpenGameInstanceFolder,
     ChangeScreen(Screen),
+    OpenGameInstanceFolder,
+    OpenURL(String),
+    CopyToClipboard(String),
+    CopyLogs,
+    MinimizeToggled(bool),
+    MainWindowForMinimize(Option<window::Id>),
+    PickInstanceIcon,
+    GotInstanceIcon(Result<Option<(Vec<u8>, String)>, String>),
+    PickInstallIcon,
+    GotInstallIcon(Result<Option<(Vec<u8>, String)>, String>),
+    InstanceIconLoaded(String, Option<Vec<u8>>),
     ScanSystemJavas,
     GotSystemJavas(Vec<system_java::SystemJava>),
     CustomJavaPathChanged(String),
     CustomJavaFlagsChanged(String),
     DetectedJavaSelected(String),
     SaveCustomJava,
-    CheckedUpdates(Result<(String, String), String>),
+    CheckedUpdates(Result<(String, String, String), String>),
     RecheckUpdates,
     Update,
-    OpenURL(String),
-    CopyToClipboard(String),
-    CopyLogs,
     GotAuthCode(auth::AuthCode),
     ManageAuth((usize, auth::WaitProgress)),
     GotXboxToken(auth::XboxLiveData),
@@ -372,9 +503,9 @@ enum Message {
     OpenInstanceSettings,
     InstanceNameChanged(String),
     InstanceRenamePressed,
-    InstanceIconChanged(String),
     InstanceRamSlider(f64),
     InstanceRamText(String),
+    InstanceEnvChanged(String),
     InstanceRamReset,
     InstanceJavaChanged(String),
     GotInstanceFabricLoaders(Result<Vec<String>, String>),
@@ -418,7 +549,7 @@ impl DgrLauncher {
         } else {
             Vec::new()
         };
-        let enviroment_variables_hash_map = if !self.game_enviroment_variables.is_empty() {
+        let mut enviroment_variables_hash_map = if !self.game_enviroment_variables.is_empty() {
             let mut hashmap = HashMap::new();
             let splitted_env_vars = self.game_enviroment_variables.split(' ');
             for i in splitted_env_vars {
@@ -443,6 +574,21 @@ impl DgrLauncher {
             "Custom" => launcher::JavaType::Custom,
             _ => launcher::JavaType::Automatic,
         };
+        // Per-instance env override, falling back to the global value.
+        // Applied late: it rewrites the map built above from globals.
+        if let Some(instance_env) = cfg.env.clone() {
+            enviroment_variables_hash_map.clear();
+            if !instance_env.is_empty() {
+                for i in instance_env.split(' ') {
+                    if i.contains('=') {
+                        let parts: Vec<String> =
+                            i.split('=').map(|p| p.to_owned()).collect();
+                        enviroment_variables_hash_map
+                            .insert(parts[0].clone(), parts[1].clone());
+                    }
+                }
+            }
+        }
         // Custom binary/flags live globally (Settings > Custom Java).
         let (jvm_path, jvm_flags) = if eff_java_name == "Custom" {
             if self.current_java_name == "Custom" {
@@ -579,6 +725,7 @@ fn boot() -> (DgrLauncher, Task<Message>) {
             DgrLauncher {
                 screen: Screen::Main,
                 language,
+                minimize_on_launch: p["minimize_on_launch"].as_bool().unwrap_or(false),
                 current_account: current_account,
                 current_version,
                 current_version_info,
@@ -669,6 +816,12 @@ impl DgrLauncher {
             Message::ClearNotices,
         )
     }
+    /// Drop a finished/failed downloader from the active list.
+    fn remove_downloader(state: &mut DgrLauncher, id: usize) {
+        if let Some(index) = state.downloaders.iter().position(|d| d.id == id) {
+            state.downloaders.remove(index);
+        }
+    }
     /// Refresh the update entry after an install. Only the version list of
     /// the SAME project may be used: a stale page list of another mod must
     /// never leak into this project's entry (it would offer A's version
@@ -702,6 +855,18 @@ impl DgrLauncher {
     fn update(state: &mut DgrLauncher, message: Message) -> Task<Message> {
         match message {
             Message::Launch => {
+                // Minimize the window while the game runs (global setting).
+                // NB: `Mode::Hidden` is NOT used: winit ignores both
+                // `set_visible` and unminimize on Wayland, so Hidden would
+                // silently do nothing there. Minimize restores natively on
+                // Windows/X11; on Wayland the exit path additionally
+                // demands attention (xdg-activation) to nudge the
+                // compositor into showing the window again.
+                let hide_task = if state.minimize_on_launch {
+                    window::latest().map(Message::MainWindowForMinimize)
+                } else {
+                    Task::none()
+                };
                 // Effective Java (per-instance override or global): a Custom
                 // pick without a binary path cannot launch.
                 let eff_java = read_instance_config(&state.current_version)
@@ -728,13 +893,16 @@ impl DgrLauncher {
                     if state.current_account.microsoft
                         && state.current_account_mc_data.token.is_empty()
                     {
-                        state.game_state_text = t!("launch.fetching_account").to_string();
-                        return Task::perform(
-                            auth::login_with_refresh_token(
-                                state.current_account.refresh_token.clone(),
+                        state.game_state_text = String::from("Fetching account data...");
+                        return Task::batch(vec![
+                            Task::perform(
+                                auth::login_with_refresh_token(
+                                    state.current_account.refresh_token.clone(),
+                                ),
+                                Message::RefreshLogin,
                             ),
-                            Message::RefreshLogin,
-                        );
+                            hide_task,
+                        ]);
                     } else {
                         state.current_account_mc_data = auth::MinecraftAccount {
                             username: state.current_account.username.clone(),
@@ -743,6 +911,7 @@ impl DgrLauncher {
                         }
                     }
                     state.launch();
+                    return hide_task;
                 }
                 Task::none()
             }
@@ -818,10 +987,38 @@ impl DgrLauncher {
                         state.game_state_text = String::new();
                         state.launcher.state = LauncherState::Idle;
                         state.game_proccess = GameProcess::Null;
+                        // Restore the minimized window. `minimize(false)` is
+                        // ignored on Wayland, so attention is demanded too:
+                        // the compositor then presents the window itself.
+                        if state.minimized_by_launcher {
+                            state.minimized_by_launcher = false;
+                            if let Some(id) = state.main_window {
+                                return Task::batch(vec![
+                                    window::minimize(id, false),
+                                    window::request_user_attention(
+                                        id,
+                                        Some(window::UserAttention::Informational),
+                                    ),
+                                ]);
+                            }
+                        }
                     }
                     launcher::Progress::Errored(e) => {
                         state.game_state_text = e;
                         state.launcher.state = LauncherState::Idle;
+                        // Launch failed: restore the minimized window.
+                        if state.minimized_by_launcher {
+                            state.minimized_by_launcher = false;
+                            if let Some(id) = state.main_window {
+                                return Task::batch(vec![
+                                    window::minimize(id, false),
+                                    window::request_user_attention(
+                                        id,
+                                        Some(window::UserAttention::Informational),
+                                    ),
+                                ]);
+                            }
+                        }
                     }
                 }
                 Task::none()
@@ -855,6 +1052,7 @@ impl DgrLauncher {
                         }
                     }
                     state.delete_confirm = None;
+                    state.instance_icons.remove(&id);
                     if state.current_version == id {
                         state.current_version = String::new();
                         state.current_version_info = String::new();
@@ -1410,6 +1608,7 @@ impl DgrLauncher {
                 let cfg = read_instance_config(&state.current_version);
                 state.instance_ram_text =
                     format!("{:.2}", cfg.ram.unwrap_or(state.game_ram));
+                state.instance_env_text = cfg.env.clone().unwrap_or_default();
                 state.instance_settings_status = String::new();
                 state.il_status = String::new();
                 state.il_manual = String::new();
@@ -1457,7 +1656,11 @@ impl DgrLauncher {
                         state.current_version = new.clone();
                         state.current_version_info = describe_version(&new);
                         state.delete_confirm = None;
-                        state.instance_name_edit = new;
+                        state.instance_name_edit = new.clone();
+                        // The icon cache follows the new id.
+                        if let Some(handle) = state.instance_icons.remove(&old) {
+                            state.instance_icons.insert(new, handle);
+                        }
                         state.instance_settings_status = t!("instance.renamed").to_string();
                         state.notice_seq = state.notice_seq.wrapping_add(1);
                         return Task::batch(vec![
@@ -1474,20 +1677,6 @@ impl DgrLauncher {
                         return clear_notices_later(state.notice_seq);
                     }
                 }
-            }
-            Message::InstanceIconChanged(preset) => {
-                let mut cfg = read_instance_config(&state.current_version);
-                cfg.icon = if preset.is_empty() {
-                    None
-                } else {
-                    Some(preset)
-                };
-                if let Err(e) = write_instance_config(&state.current_version, &cfg) {
-                    state.instance_settings_status = e;
-                    state.notice_seq = state.notice_seq.wrapping_add(1);
-                    return clear_notices_later(state.notice_seq);
-                }
-                Task::none()
             }
             Message::InstanceRamSlider(ram) => {
                 let mut cfg = read_instance_config(&state.current_version);
@@ -1517,15 +1706,30 @@ impl DgrLauncher {
                     }
                     _ => {
                         state.instance_settings_status =
-                            t!("instance.ram_range").to_string();
+                            t!("common.ram_range").to_string();
                         state.notice_seq = state.notice_seq.wrapping_add(1);
                         return clear_notices_later(state.notice_seq);
                     }
                 }
                 Task::none()
             }
-            Message::InstanceRamReset => {
+            Message::InstanceEnvChanged(s) => {
+                // Empty = back to the global value (`None`).
+                state.instance_env_text = s.clone();
                 let mut cfg = read_instance_config(&state.current_version);
+                cfg.env = if s.trim().is_empty() {
+                    None
+                } else {
+                    Some(s)
+                };
+                if let Err(e) = write_instance_config(&state.current_version, &cfg) {
+                    state.instance_settings_status = e;
+                } else {
+                    state.instance_settings_status = String::new();
+                }
+                Task::none()
+            }
+            Message::InstanceRamReset => {                let mut cfg = read_instance_config(&state.current_version);
                 cfg.ram = None;
                 if let Err(e) = write_instance_config(&state.current_version, &cfg) {
                     state.instance_settings_status = e;
@@ -1620,7 +1824,7 @@ impl DgrLauncher {
                 if version_kind(&state.current_version) == VersionKind::Fabric {
                     if state.il_selected.is_empty() {
                         state.il_status =
-                            t!("instance.select_fabric_first").to_string();
+                            t!("common.select_fabric_first").to_string();
                         state.notice_seq = state.notice_seq.wrapping_add(1);
                         return clear_notices_later(state.notice_seq);
                     }
@@ -1631,6 +1835,7 @@ impl DgrLauncher {
                         loader = &loader
                     )
                     .to_string();
+                    carry_icon_to_target(state, format!("{base}-fabric"));
                     state.downloaders.push(Downloader::new(state.downloaders.len()));
                     let index = state.downloaders.len() - 1;
                     state.downloaders[index].start(
@@ -1646,7 +1851,7 @@ impl DgrLauncher {
                         state.il_selected.clone()
                     };
                     if nf.is_empty() {
-                        state.il_status = t!("instance.select_neoforge_manual").to_string();
+                        state.il_status = t!("common.select_neoforge_manual").to_string();
                         state.notice_seq = state.notice_seq.wrapping_add(1);
                         return clear_notices_later(state.notice_seq);
                     }
@@ -1655,8 +1860,9 @@ impl DgrLauncher {
                     // Same installer flow as the Installation screen; when it
                     // finishes, the selection moves to the new instance.
                     state.pending_loader_switch = Some(format!("neoforge-{nf}"));
+                    carry_icon_to_target(state, format!("neoforge-{nf}"));
                     state.il_status =
-                        t!("instance.downloading_mc_first").to_string();
+                        t!("common.downloading_mc_first").to_string();
                     state.downloaders.push(Downloader::new(state.downloaders.len()));
                     let index = state.downloaders.len() - 1;
                     state.downloaders[index]
@@ -1675,6 +1881,7 @@ impl DgrLauncher {
                         state.game_wrapper_commands.clone(),
                         state.game_enviroment_variables.clone(),
                         state.show_all_versions_in_download_list,
+                        state.minimize_on_launch,
                     )
                     .unwrap();
                 }
@@ -1709,10 +1916,6 @@ impl DgrLauncher {
                     _ => Task::none(),
                 }
             }
-            Message::OpenGameFolder => {
-                open::that(launcher::get_minecraft_dir()).unwrap();
-                Task::none()
-            }
             Message::OpenGameInstanceFolder => {
                 // Each version runs in its own isolated folder:
                 // dgrlauncher_instances/<version>.
@@ -1726,6 +1929,104 @@ impl DgrLauncher {
                 }
                 if let Err(e) = open::that(&dir) {
                     println!("Failed to open game instance folder: {e}");
+                }
+                Task::none()
+            }
+            Message::MinimizeToggled(on) => {
+                state.minimize_on_launch = on;
+                if let Err(e) = updatesettingsfile(
+                    state.game_ram,
+                    state.current_java_name.clone(),
+                    state.game_wrapper_commands.clone(),
+                    state.game_enviroment_variables.clone(),
+                    state.show_all_versions_in_download_list,
+                    state.minimize_on_launch,
+                ) {
+                    println!("Failed to save minimize setting: {e}");
+                }
+                Task::none()
+            }
+            Message::MainWindowForMinimize(id) => {
+                // Minimize the main window while the game runs; the id is
+                // kept so it can be restored on game exit.
+                match id {
+                    Some(id) => {
+                        state.main_window = Some(id);
+                        state.minimized_by_launcher = true;
+                        window::minimize(id, true)
+                    }
+                    None => Task::none(),
+                }
+            }
+            Message::PickInstanceIcon => {
+                if state.current_version.is_empty() {
+                    return Task::none();
+                }
+                Task::perform(pick_icon_file(), Message::GotInstanceIcon)
+            }
+            Message::GotInstanceIcon(result) => {
+                match result {
+                    Ok(None) => Task::none(),
+                    Ok(Some((bytes, ext))) => {
+                        let version = state.current_version.clone();
+                        match write_instance_icon(&version, &bytes, &ext) {
+                            Ok(()) => {
+                                state.instance_icons.insert(
+                                    version,
+                                    iced::widget::image::Handle::from_bytes(bytes),
+                                );
+                                state.instance_settings_status =
+                                    t!("icon.saved").to_string();
+                                state.notice_seq = state.notice_seq.wrapping_add(1);
+                                clear_notices_later(state.notice_seq)
+                            }
+                            Err(e) => {
+                                state.instance_settings_status = e;
+                                state.notice_seq = state.notice_seq.wrapping_add(1);
+                                clear_notices_later(state.notice_seq)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        state.instance_settings_status = e;
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        clear_notices_later(state.notice_seq)
+                    }
+                }
+            }
+            Message::PickInstallIcon => {
+                Task::perform(pick_icon_file(), Message::GotInstallIcon)
+            }
+            Message::GotInstallIcon(result) => {
+                match result {
+                    Ok(None) => Task::none(),
+                    Ok(Some((bytes, ext))) => {
+                        state.install_icon = Some((
+                            iced::widget::image::Handle::from_bytes(bytes.clone()),
+                            bytes,
+                            ext,
+                        ));
+                        state.download_text = String::new();
+                        Task::none()
+                    }
+                    Err(e) => {
+                        state.download_text = e;
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        clear_notices_later(state.notice_seq)
+                    }
+                }
+            }
+            Message::InstanceIconLoaded(version, bytes) => {
+                match bytes {
+                    Some(bytes) => {
+                        state.instance_icons.insert(
+                            version,
+                            iced::widget::image::Handle::from_bytes(bytes),
+                        );
+                    }
+                    None => {
+                        state.instance_icons.remove(&version);
+                    }
                 }
                 Task::none()
             }
@@ -1823,7 +2124,7 @@ impl DgrLauncher {
                     }
                     _ => {
                         state.settings_status =
-                            t!("settings.ram_range").to_string();
+                            t!("common.ram_range").to_string();
                     }
                 }
                 Task::none()
@@ -1975,6 +2276,8 @@ impl DgrLauncher {
                 // Progress lines ("Downloading...") are never armed.
                 if seq == state.notice_seq {
                     state.download_text = String::new();
+                    state.files_download_number = 0;
+                    state.files_downloaded = 0;
                     state.neoforge_status = String::new();
                     state.modstore_status = String::new();
                     state.instance_settings_status = String::new();
@@ -2013,10 +2316,24 @@ impl DgrLauncher {
                             .push((default_id, custom.clone()));
                     }
                 };
+                // Remember (default id -> icon) the same way: the picked
+                // icon is written to the finished instance dir.
+                let install_icon = state.install_icon.clone();
+                let mut remember_icon = |default_id: String| {
+                    state
+                        .pending_install_icons
+                        .retain(|(o, _, _)| *o != default_id);
+                    if let Some((_, bytes, ext)) = install_icon.clone() {
+                        state
+                            .pending_install_icons
+                            .push((default_id, bytes, ext));
+                    }
+                };
                 match state.install_loader {
                     LoaderChoice::Vanilla => {
                         let version = state.install_mc_version.clone();
                         remember_custom(version.clone());
+                        remember_icon(version.clone());
                         state.downloaders
                             .push(Downloader::new(state.downloaders.len()));
                         let index = state.downloaders.len() - 1;
@@ -2026,13 +2343,15 @@ impl DgrLauncher {
                     LoaderChoice::Fabric => {
                         if state.fabric_loader_selected.is_empty() {
                             state.download_text =
-                                t!("install.select_fabric_first").to_string();
+                                t!("common.select_fabric_first").to_string();
                             state.notice_seq = state.notice_seq.wrapping_add(1);
                             return clear_notices_later(state.notice_seq);
                         }
                         let version = state.install_mc_version.clone();
                         let loader = state.fabric_loader_selected.clone();
-                        remember_custom(format!("{version}-fabric"));
+                        let default_id = format!("{version}-fabric");
+                        remember_custom(default_id.clone());
+                        remember_icon(default_id);
                         state.downloaders
                             .push(Downloader::new(state.downloaders.len()));
                         let index = state.downloaders.len() - 1;
@@ -2049,17 +2368,19 @@ impl DgrLauncher {
                         };
                         if nf.is_empty() {
                             state.neoforge_status =
-                                t!("install.select_neoforge_manual").to_string();
+                                t!("common.select_neoforge_manual").to_string();
                             state.notice_seq = state.notice_seq.wrapping_add(1);
                             return clear_notices_later(state.notice_seq);
                         }
-                        remember_custom(format!("neoforge-{nf}"));
+                        let default_id = format!("neoforge-{nf}");
+                        remember_custom(default_id.clone());
+                        remember_icon(default_id);
                         let mc = state.install_mc_version.clone();
                         // Remember the target through the whole chain
                         // (vanilla prefetch -> installer -> optional java).
                         state.pending_neoforge_install = Some((mc.clone(), nf));
                         state.neoforge_status =
-                            t!("install.downloading_mc_first").to_string();
+                            t!("common.downloading_mc_first").to_string();
                         // Prefetch vanilla files so the game doesn't have to
                         // download them on first launch; when this flow
                         // finishes, the installer starts (see Finished).
@@ -2070,6 +2391,8 @@ impl DgrLauncher {
                             .start(mc, downloader::VersionType::Vanilla);
                     }
                 }
+                // The picked install icon is consumed by this install.
+                state.install_icon = None;
                 Task::none()
             }
             Message::ManageDownload((id, progress)) => {
@@ -2078,12 +2401,14 @@ impl DgrLauncher {
                         state.download_text =
                             t!("install.progress_start", total = file_number).to_string();
                         state.files_download_number = file_number;
+                        state.files_downloaded = 0;
                     }
                     downloader::Progress::Downloaded(remaining_files_number) => {
                         let downloaded_files = state.files_download_number - remaining_files_number;
                         let percentage = (downloaded_files as f32
                             / state.files_download_number as f32
                             * 100.0) as i32;
+                        state.files_downloaded = downloaded_files;
                         state.download_text = t!(
                             "install.progress",
                             done = downloaded_files,
@@ -2102,14 +2427,12 @@ impl DgrLauncher {
                             .and_then(|d| finished_version_dir_id(&d.state));
                         state.download_text =
                             t!("install.installed_ok").to_string();
-                        for (index, downloader) in state.downloaders.iter().enumerate() {
-                            if downloader.id == id {
-                                state.downloaders.remove(index);
-                                break;
-                            }
-                        }
+                        // Full bar under the success notice.
+                        state.files_downloaded = state.files_download_number;
+                        remove_downloader(state, id);
                         // Custom instance name: rename the finished version.
                         let mut refresh = false;
+                        let mut final_version_id = finished_version.clone();
                         if let Some(old_id) = finished_version {
                             if let Some(pos) = state
                                 .pending_install_names
@@ -2130,6 +2453,15 @@ impl DgrLauncher {
                                         )
                                         .to_string();
                                         refresh = true;
+                                        final_version_id = Some(custom.clone());
+                                        // A selected version keeps pointing
+                                        // at the renamed dir.
+                                        if state.current_version == old_id {
+                                            state.current_version = custom.clone();
+                                            state.current_version_info =
+                                                describe_version(&custom);
+                                            state.delete_confirm = None;
+                                        }
                                     }
                                     Err(e) => {
                                         state.download_text = t!(
@@ -2137,6 +2469,33 @@ impl DgrLauncher {
                                             err = e.to_string()
                                         )
                                         .to_string();
+                                    }
+                                }
+                            }
+                            // Custom icon picked on the Installation screen
+                            // (or carried over by a loader switch): keyed by
+                            // the default id, written to the final dir.
+                            if let Some(pos) = state
+                                .pending_install_icons
+                                .iter()
+                                .position(|(o, _, _)| *o == old_id)
+                            {
+                                let (_, bytes, ext) =
+                                    state.pending_install_icons.remove(pos);
+                                let target = final_version_id
+                                    .clone()
+                                    .unwrap_or_else(|| old_id.clone());
+                                match write_instance_icon(&target, &bytes, &ext) {
+                                    Ok(()) => {
+                                        state.instance_icons.insert(
+                                            target,
+                                            iced::widget::image::Handle::from_bytes(
+                                                bytes,
+                                            ),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        state.download_text = e;
                                     }
                                 }
                             }
@@ -2169,12 +2528,9 @@ impl DgrLauncher {
                             t!("install.install_failed", err = &error).to_string();
                         state.restrict_launch = false;
                         state.pending_neoforge_install = None;
-                        for (index, downloader) in state.downloaders.iter().enumerate() {
-                            if downloader.id == id {
-                                state.downloaders.remove(index);
-                                break;
-                            }
-                        }
+                        state.files_download_number = 0;
+                        state.files_downloaded = 0;
+                        remove_downloader(state, id);
                         state.notice_seq = state.notice_seq.wrapping_add(1);
                         return clear_notices_later(state.notice_seq);
                     }
@@ -2183,8 +2539,10 @@ impl DgrLauncher {
                         state.game_state_text =
                             t!("launch.java_start", total = size).to_string();
                         state.java_download_size = size;
+                        state.java_downloaded = 0;
                     }
                     downloader::Progress::JavaDownloadProgressed(downloaded, percentage) => {
+                        state.java_downloaded = downloaded;
                         state.game_state_text = t!(
                             "launch.java_progress",
                             done = downloaded,
@@ -2199,12 +2557,9 @@ impl DgrLauncher {
                     downloader::Progress::JavaExtracted => {
                         state.game_state_text = t!("launch.java_ok").to_string();
                         state.restrict_launch = false;
-                        for (index, downloader) in state.downloaders.iter().enumerate() {
-                            if downloader.id == id {
-                                state.downloaders.remove(index);
-                                break;
-                            }
-                        }
+                        state.java_download_size = 0;
+                        state.java_downloaded = 0;
+                        remove_downloader(state, id);
                         // Java downloaded for a pending NeoForge install:
                         // continue with the installer instead of launching.
                         if let Some((mc, nf)) = state.pending_neoforge_install.take() {
@@ -2261,6 +2616,7 @@ impl DgrLauncher {
                             t!("install.neoforge_ok").to_string();
                         if let Some(nf) = finished_nf {
                             let old_id = format!("neoforge-{nf}");
+                            let mut final_id = old_id.clone();
                             if let Some(pos) = state
                                 .pending_install_names
                                 .iter()
@@ -2279,6 +2635,15 @@ impl DgrLauncher {
                                             name = &custom
                                         )
                                         .to_string();
+                                        final_id = custom.clone();
+                                        // A loader switch moves the selection
+                                        // to the renamed instance.
+                                        if state.current_version == old_id {
+                                            state.current_version = custom.clone();
+                                            state.current_version_info =
+                                                describe_version(&custom);
+                                            state.delete_confirm = None;
+                                        }
                                     }
                                     Err(e) => {
                                         state.download_text = t!(
@@ -2289,13 +2654,31 @@ impl DgrLauncher {
                                     }
                                 }
                             }
-                        }
-                        for (index, downloader) in state.downloaders.iter().enumerate() {
-                            if downloader.id == id {
-                                state.downloaders.remove(index);
-                                break;
+                            // Custom install icon (or carried loader-switch
+                            // icon), keyed by the default id.
+                            if let Some(pos) = state
+                                .pending_install_icons
+                                .iter()
+                                .position(|(o, _, _)| *o == old_id)
+                            {
+                                let (_, bytes, ext) =
+                                    state.pending_install_icons.remove(pos);
+                                match write_instance_icon(&final_id, &bytes, &ext) {
+                                    Ok(()) => {
+                                        state.instance_icons.insert(
+                                            final_id,
+                                            iced::widget::image::Handle::from_bytes(
+                                                bytes,
+                                            ),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        state.download_text = e;
+                                    }
+                                }
                             }
                         }
+                        remove_downloader(state, id);
                         state.notice_seq = state.notice_seq.wrapping_add(1);
                         return Task::batch(vec![
                             Task::perform(
@@ -2312,19 +2695,18 @@ impl DgrLauncher {
                     }
                     downloader::Progress::MissingFilesDownloadFinished => {
                         state.restrict_launch = false;
-                        for (index, downloader) in state.downloaders.iter().enumerate() {
-                            if downloader.id == id {
-                                state.downloaders.remove(index);
-                                break;
-                            }
-                        }
+                        remove_downloader(state, id);
                         state.launch();
                     }
                     downloader::Progress::UpdateStarted(total) => {
                         state.update_text =
-                            t!("launch.update_start", total = total).to_string()
+                            t!("launch.update_start", total = total).to_string();
+                        state.update_total = total;
+                        state.update_downloaded = 0;
                     }
                     downloader::Progress::UpdateProgressed(downloaded, percentage, total) => {
+                        state.update_total = total;
+                        state.update_downloaded = downloaded;
                         state.update_text = t!(
                             "launch.update_progress",
                             done = downloaded,
@@ -2334,12 +2716,7 @@ impl DgrLauncher {
                         .to_string()
                     }
                     downloader::Progress::UpdateFinished => {
-                        for (index, downloader) in state.downloaders.iter().enumerate() {
-                            if downloader.id == id {
-                                state.downloaders.remove(index);
-                                break;
-                            }
-                        }
+                        remove_downloader(state, id);
                         let exec_path = match env::current_exe() {
                             Ok(p) => p,
                             Err(e) => {
@@ -2409,7 +2786,19 @@ impl DgrLauncher {
                     state.current_version = ver_list[0].clone()
                 }
                 state.current_version_info = describe_version(&state.current_version);
-                Task::none()
+                // Load custom icons for the listed versions.
+                let mut tasks = Vec::new();
+                for v in &ver_list {
+                    let version = v.clone();
+                    tasks.push(Task::perform(
+                        async move {
+                            let bytes = read_instance_icon_bytes(&version);
+                            (version, bytes)
+                        },
+                        |(version, bytes)| Message::InstanceIconLoaded(version, bytes),
+                    ));
+                }
+                Task::batch(tasks)
             }
             Message::GameEnviromentVariablesChanged(s) => {
                 state.game_enviroment_variables = s;
@@ -2439,18 +2828,23 @@ impl DgrLauncher {
             }
             Message::CheckedUpdates(result) => {
                 match result {
-                    Ok((url, last_version)) => {
+                    Ok((url, last_version, notes)) => {
                         state.update_available = true;
                         state.update_url = url;
                         state.last_version = last_version;
+                        state.update_notes = notes;
                     }
-                    Err(e) => state.last_version = e,
+                    Err(e) => {
+                        state.last_version = e;
+                        state.update_notes = String::new();
+                    }
                 }
                 Task::none()
             }
             Message::RecheckUpdates => {
                 state.update_available = false;
                 state.update_text = String::new();
+                state.update_notes = String::new();
                 state.last_version = t!("launch.checking_updates").to_string();
                 return Task::perform(
                     update_manager::check_launcher_updates(),
@@ -2763,6 +3157,12 @@ fn checksettingsfile() -> bool {
                 serde_json::to_value(false).unwrap(),
             );
         }
+        if !map.contains_key("minimize_on_launch") {
+            map.insert(
+                "minimize_on_launch".to_owned(),
+                serde_json::to_value(false).unwrap(),
+            );
+        }
         if !map.contains_key("language") {
             // First launch (or pre-i18n config): auto-detect once from the
             // OS locale, then it only changes manually in Settings.
@@ -2777,56 +3177,44 @@ fn checksettingsfile() -> bool {
     !file_exists
 }
 fn updateusersettingsfile(current_account: Account, version: String) -> std::io::Result<()> {
-    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
-    let mut file = File::open(get_config_file_path())?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    let mut data: Value = serde_json::from_str(&contents)?;
+    let mut data = load_config()?;
     data["current_account"] = serde_json::json!(current_account);
     data["current_version"] = serde_json::Value::String(version);
-    let serialized = serde_json::to_string_pretty(&data)?;
-    let mut file = OpenOptions::new()
+    store_config(&data)
+}
+/// Settings-file transaction core shared by all persist helpers:
+/// legacy cwd reset (kept: the game launch moves cwd into the instance
+/// dir), read, parse. Serde failures map to `InvalidData`, exactly like
+/// the old `?` conversions did — callers only ever check presence.
+fn load_config() -> std::io::Result<Value> {
+    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
+    let mut contents = String::new();
+    File::open(get_config_file_path())?.read_to_string(&mut contents)?;
+    serde_json::from_str(&contents)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+/// Write back a mutated settings json (same legacy cwd reset).
+fn store_config(data: &Value) -> std::io::Result<()> {
+    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
+    let serialized = serde_json::to_string_pretty(data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    OpenOptions::new()
         .write(true)
         .truncate(true)
-        .open(get_config_file_path())?;
-    file.write_all(serialized.as_bytes())?;
+        .open(get_config_file_path())?
+        .write_all(serialized.as_bytes())?;
     Ok(())
 }
 fn persist_current_account(current_account: &Account) {
-    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
-    let mut file = match File::open(get_config_file_path()) {
-        Ok(f) => f,
-        Err(e) => {
-            println!("Failed to persist current account: {e}");
-            return;
-        }
-    };
-    let mut contents = String::new();
-    if file.read_to_string(&mut contents).is_err() {
-        println!("Failed to persist current account: cannot read config");
-        return;
-    }
-    let mut data: Value = match serde_json::from_str(&contents) {
-        Ok(v) => v,
+    let mut data = match load_config() {
+        Ok(data) => data,
         Err(e) => {
             println!("Failed to persist current account: {e}");
             return;
         }
     };
     data["current_account"] = serde_json::json!(current_account);
-    let serialized = serde_json::to_string_pretty(&data).unwrap();
-    let mut file = match OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(get_config_file_path())
-    {
-        Ok(f) => f,
-        Err(e) => {
-            println!("Failed to persist current account: {e}");
-            return;
-        }
-    };
-    if let Err(e) = file.write_all(serialized.as_bytes()) {
+    if let Err(e) = store_config(&data) {
         println!("Failed to persist current account: {e}");
     }
 }
@@ -2957,21 +3345,8 @@ fn sanitize_java_name(name: &str) -> String {
     }
 }
 fn persist_config_keys(keys: &[(&str, String)]) {
-    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
-    let mut file = match File::open(get_config_file_path()) {
-        Ok(f) => f,
-        Err(e) => {
-            println!("Failed to persist java settings: {e}");
-            return;
-        }
-    };
-    let mut contents = String::new();
-    if file.read_to_string(&mut contents).is_err() {
-        println!("Failed to persist java settings: cannot read config");
-        return;
-    }
-    let mut data: Value = match serde_json::from_str(&contents) {
-        Ok(v) => v,
+    let mut data = match load_config() {
+        Ok(data) => data,
         Err(e) => {
             println!("Failed to persist java settings: {e}");
             return;
@@ -2980,19 +3355,7 @@ fn persist_config_keys(keys: &[(&str, String)]) {
     for (key, value) in keys {
         data[*key] = serde_json::Value::String(value.clone());
     }
-    let serialized = serde_json::to_string_pretty(&data).unwrap();
-    let mut file = match OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(get_config_file_path())
-    {
-        Ok(f) => f,
-        Err(e) => {
-            println!("Failed to persist java settings: {e}");
-            return;
-        }
-    };
-    if let Err(e) = file.write_all(serialized.as_bytes()) {
+    if let Err(e) = store_config(&data) {
         println!("Failed to persist java settings: {e}");
     }
 }
@@ -3006,11 +3369,7 @@ fn persist_custom_java(path: &str, flags: &str) {
     ]);
 }
 fn save_account(account: Account) -> Vec<Account> {
-    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
-    let mut file = File::open(get_config_file_path()).unwrap();
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-    let mut data: Value = serde_json::from_str(&contents).unwrap();
+    let mut data = load_config().unwrap();
     if let Value::Array(arr) = &mut data["accounts"] {
         arr.push(serde_json::json!(account));
         data["accounts"] = serde_json::json!(arr);
@@ -3028,13 +3387,7 @@ fn save_account(account: Account) -> Vec<Account> {
             })
         }
     }
-    let serialized = serde_json::to_string_pretty(&data).unwrap();
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(get_config_file_path())
-        .unwrap();
-    file.write_all(serialized.as_bytes()).unwrap();
+    store_config(&data).unwrap();
     updated_account_list
 }
 fn updatesettingsfile(
@@ -3043,24 +3396,16 @@ fn updatesettingsfile(
     wrapper_commands: String,
     env_variables: String,
     showallversions: bool,
+    minimize_on_launch: bool,
 ) -> std::io::Result<()> {
-    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
-    let mut file = File::open(get_config_file_path())?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    let mut data: Value = serde_json::from_str(&contents)?;
+    let mut data = load_config()?;
     data["game_ram"] = serde_json::Value::Number(Number::from_f64(ram).unwrap());
     data["current_java_name"] = serde_json::Value::String(currentjvm);
     data["game_wrapper_commands"] = serde_json::Value::String(wrapper_commands);
     data["show_all_versions"] = serde_json::Value::Bool(showallversions);
+    data["minimize_on_launch"] = serde_json::Value::Bool(minimize_on_launch);
     data["game_enviroment_variables"] = serde_json::Value::String(env_variables);
-    let serialized = serde_json::to_string_pretty(&data)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(get_config_file_path())?;
-    file.write_all(serialized.as_bytes())?;
-    Ok(())
+    store_config(&data)
 }
 #[derive(Debug)]
 struct Launcher {

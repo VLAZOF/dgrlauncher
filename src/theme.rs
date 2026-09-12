@@ -1,6 +1,7 @@
 use iced::overlay::menu;
 use iced::widget::{
-    button, container, pick_list, scrollable, slider, svg, text, text_input, toggler,
+    button, container, pick_list, progress_bar, scrollable, slider, svg, text,
+    text_input, toggler,
 };
 use iced::{Background, Border, Color, Shadow, color, theme};
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -480,6 +481,26 @@ impl slider::Catalog for Theme {
     }
     fn style(&self, class: &Self::Class<'_>, status: slider::Status) -> slider::Style {
         class(self, status)
+    }
+}
+/// Slim download bar: dark track, green fill (matches accent text).
+pub fn progress_bar_default(_theme: &Theme) -> progress_bar::Style {
+    progress_bar::Style {
+        background: Background::Color(Color::from_rgb8(49, 50, 68)),
+        bar: Background::Color(Color::from_rgb8(166, 218, 149)),
+        border: Border {
+            radius: 6.0.into(),
+            ..Default::default()
+        },
+    }
+}
+impl progress_bar::Catalog for Theme {
+    type Class<'a> = progress_bar::StyleFn<'a, Self>;
+    fn default<'a>() -> Self::Class<'a> {
+        Box::new(progress_bar_default)
+    }
+    fn style(&self, class: &Self::Class<'_>) -> progress_bar::Style {
+        class(self)
     }
 }
 fn scrollable_style() -> scrollable::Style {
