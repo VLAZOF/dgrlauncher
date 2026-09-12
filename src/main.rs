@@ -3,7 +3,7 @@ use self::widget::Element;
 use iced::{
     alignment, clipboard,
     event::listen_with,
-    widget::{button, column, container, row, space, svg, tooltip, Button},
+    widget::{button, column, container, row, space, svg, text, tooltip, Button},
     window::{self},
     Alignment, Length, Subscription, Task,
 };
@@ -22,14 +22,18 @@ use std::{
 use std::{fs::File, sync::Arc};
 use widget::Renderer;
 mod downloader;
+mod i18n;
 mod launcher;
 mod modrinth;
 mod theme;
 use theme::Theme;
+use rust_i18n::t;
 mod auth;
 mod screens;
 mod system_java;
 mod update_manager;
+
+rust_i18n::i18n!("locales", fallback = "en");
 fn load_window_icon() -> Option<window::icon::Icon> {
     let bytes = include_bytes!("icons/dgrlauncher.png");
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
@@ -182,6 +186,9 @@ struct DgrLauncher {
     /// Global RAM manual input mirror + validation hint (Settings).
     settings_ram_text: String,
     settings_status: String,
+    /// UI language code ("en" | "ru"). Set once in `boot()` from the
+    /// config (auto-detected on first launch), changed in Settings.
+    language: String,
     /// `(default version id, custom name)` renames applied when each
     /// install finishes (validated at press, executed at finish).
     pending_install_names: Vec<(String, String)>,
@@ -298,6 +305,7 @@ enum Message {
     VersionChanged(String),
     DeleteInstancePressed(String),
     JavaChanged(String),
+    LanguageChanged(String),
     GameRamChanged(f64),
     GameWrapperCommandsChanged(String),
     GameEnviromentVariablesChanged(String),
@@ -482,6 +490,18 @@ fn boot() -> (DgrLauncher, Task<Message>) {
         file.read_to_string(&mut fcontent).unwrap();
         let content = serde_json::from_str(&fcontent);
         let p: Value = content.unwrap();
+        // Language: stored preference wins; missing/corrupt values fall
+        // back to English (first launch was auto-detected in
+        // `checksettingsfile`, which runs right above).
+        let language = {
+            let stored = p["language"].as_str().unwrap_or("");
+            let code = i18n::sanitize_language(stored);
+            i18n::apply(&code);
+            if stored != code {
+                persist_config_keys(&[("language", code.clone())]);
+            }
+            code
+        };
         let mut currentjava = Java {
             name: String::new(),
             path: String::new(),
@@ -558,6 +578,7 @@ fn boot() -> (DgrLauncher, Task<Message>) {
         (
             DgrLauncher {
                 screen: Screen::Main,
+                language,
                 current_account: current_account,
                 current_version,
                 current_version_info,
@@ -696,9 +717,7 @@ impl DgrLauncher {
                             .to_owned()
                     };
                     if path.trim().is_empty() {
-                        state.game_state_text = String::from(
-                            "Set a custom Java path first (Settings > Custom Java).",
-                        );
+                        state.game_state_text = t!("launch.custom_java_first").to_string();
                         return Task::none();
                     }
                 }
@@ -709,7 +728,7 @@ impl DgrLauncher {
                     if state.current_account.microsoft
                         && state.current_account_mc_data.token.is_empty()
                     {
-                        state.game_state_text = String::from("Fetching account data...");
+                        state.game_state_text = t!("launch.fetching_account").to_string();
                         return Task::perform(
                             auth::login_with_refresh_token(
                                 state.current_account.refresh_token.clone(),
@@ -734,9 +753,9 @@ impl DgrLauncher {
                             match missing {
                                 launcher::Missing::Java(major) => {
                                     state.launcher.state = LauncherState::Waiting;
-                                    state.game_state_text = format!(
-                                        "Downloading Java {major}..."
-                                    );
+                                    state.game_state_text =
+                                        t!("launch.downloading_java", major = major)
+                                            .to_string();
                                     state.downloaders.push(Downloader {
                                         state: DownloaderState::Idle,
                                         id: state.downloaders.len(),
@@ -747,7 +766,7 @@ impl DgrLauncher {
                                 }
                                 launcher::Missing::VersionFiles(vec) => {
                                     state.game_state_text =
-                                        String::from("Found missing files. Starting download.");
+                                        t!("launch.missing_files").to_string();
                                     state.launcher.state = LauncherState::Waiting;
                                     state.downloaders.push(Downloader {
                                         state: DownloaderState::Idle,
@@ -759,7 +778,7 @@ impl DgrLauncher {
                                 launcher::Missing::VanillaJson(ver, folder) => {
                                     state.launcher.state = LauncherState::Waiting;
                                     state.game_state_text =
-                                        String::from("Downloading required json");
+                                        t!("launch.downloading_json").to_string();
                                     return Task::perform(
                                         async move {
                                             match downloader::downloadversionjson(
@@ -877,7 +896,7 @@ impl DgrLauncher {
                 state.modstore_scroll = 0.0;
                 state.modstore_installed =
                     modrinth::installed_mods(&state.current_version);
-                state.modstore_status = String::from("Loading popular mods...");
+                state.modstore_status = t!("store.loading_popular").to_string();
                 // Auto update check for installed mods (manual button too).
                 let (mc, loader) = modrinth::instance_loader(&state.current_version)
                     .unwrap_or_default();
@@ -917,7 +936,7 @@ impl DgrLauncher {
                     return Task::none();
                 }
                 state.modstore_results = Vec::new();
-                state.modstore_status = String::from("Searching...");
+                state.modstore_status = t!("store.searching").to_string();
                 return Task::perform(
                     async move { modrinth::search_mods(&query).await },
                     Message::GotModSearch,
@@ -931,7 +950,7 @@ impl DgrLauncher {
                 state.modstore_search_seq = state.modstore_search_seq.wrapping_add(1);
                 let query = state.modstore_query.clone();
                 state.modstore_results = Vec::new();
-                state.modstore_status = String::from("Searching...");
+                state.modstore_status = t!("store.searching").to_string();
                 return Task::perform(
                     async move { modrinth::search_mods(&query).await },
                     Message::GotModSearch,
@@ -942,7 +961,7 @@ impl DgrLauncher {
                     Ok(list) => {
                         if list.is_empty() {
                             state.modstore_status =
-                                String::from("Nothing found. Try another query.");
+                                t!("store.nothing_found").to_string();
                         } else {
                             state.modstore_status = String::new();
                         }
@@ -992,7 +1011,7 @@ impl DgrLauncher {
                 state.modstore_delete_confirm = None;
                 state.modstore_hovered_version = None;
                 state.modstore_deps_expanded = false;
-                state.modstore_status = String::from("Loading mod page...");
+                state.modstore_status = t!("store.loading_page").to_string();
                 return fetch_mod_page(id);
             }
             Message::GotModDetail(result) => {
@@ -1069,7 +1088,7 @@ impl DgrLauncher {
                     {
                         state.modstore_linking = true;
                         state.modstore_status =
-                            String::from("Identifying hand-added files...");
+                            t!("store.identifying").to_string();
                         let instance = state.current_version.clone();
                         tasks.push(Task::perform(
                             async move { modrinth::link_unlinked_mods(&instance).await },
@@ -1104,12 +1123,11 @@ impl DgrLauncher {
                         state.modstore_unlinked =
                             modrinth::unlinked_mod_files(&state.current_version);
                         if n > 0 {
-                            state.modstore_status = format!(
-                                "Linked {n} hand-added mod(s) ✓"
-                            );
+                            state.modstore_status =
+                                t!("store.linked", count = n).to_string();
                             armed = true;
-                        } else if state.modstore_status
-                            == "Identifying hand-added files..."
+                        } else if state.modstore_status.as_str()
+                            == t!("store.identifying").as_ref()
                         {
                             state.modstore_status = String::new();
                         }
@@ -1139,9 +1157,10 @@ impl DgrLauncher {
                             name
                         );
                         if let Err(e) = std::fs::remove_file(&path) {
-                            state.modstore_status = format!("Delete failed: {e}");
+                            state.modstore_status =
+                                t!("store.delete_failed", err = e.to_string()).to_string();
                         } else {
-                            state.modstore_status = String::from("File deleted.");
+                            state.modstore_status = t!("store.file_deleted").to_string();
                         }
                     }
                     state.modstore_delete_confirm = None;
@@ -1181,7 +1200,8 @@ impl DgrLauncher {
                 }
                 let instance = state.current_version.clone();
                 state.modstore_downloading = true;
-                state.modstore_status = format!("Downloading {}...", version.filename);
+                state.modstore_status =
+                    t!("store.downloading", file = &version.filename).to_string();
                 return Task::perform(
                     async move { modrinth::install_mod(&instance, &detail, &version).await },
                     Message::ModInstallFinished,
@@ -1194,7 +1214,8 @@ impl DgrLauncher {
                 match result {
                     Ok(entry) => {
                         state.modstore_status =
-                            format!("Installed {} ✓", entry.version_number);
+                            t!("store.installed_v", version = &entry.version_number)
+                                .to_string();
                         state.modstore_installed =
                             modrinth::installed_mods(&state.current_version);
                         if state.modstore_update_confirm.as_deref()
@@ -1240,7 +1261,7 @@ impl DgrLauncher {
                     {
                         state.modstore_status = e;
                     } else {
-                        state.modstore_status = String::from("Mod deleted.");
+                        state.modstore_status = t!("store.mod_deleted").to_string();
                     }
                     state.modstore_delete_confirm = None;
                     state.modstore_updates.remove(&project_id);
@@ -1274,15 +1295,15 @@ impl DgrLauncher {
                 if checks.is_empty() {
                     state.modstore_check_manual = false;
                     state.modstore_status = if state.modstore_installed.is_empty() {
-                        String::from("No mods installed.")
+                        t!("store.none_installed").to_string()
                     } else {
-                        String::from("All mods up to date ✓")
+                        t!("store.all_uptodate").to_string()
                     };
                     state.notice_seq = state.notice_seq.wrapping_add(1);
                     return clear_notices_later(state.notice_seq);
                 }
                 state.modstore_check_manual = true;
-                state.modstore_status = String::from("Checking updates...");
+                state.modstore_status = t!("store.checking").to_string();
                 return Task::batch(checks);
             }
             Message::ModUpdateChecked(pid, latest) => {
@@ -1299,9 +1320,13 @@ impl DgrLauncher {
                 if state.modstore_pending_checks == 0 && state.modstore_check_manual {
                     state.modstore_check_manual = false;
                     state.modstore_status = if state.modstore_updates.is_empty() {
-                        String::from("All mods up to date ✓")
+                        t!("store.all_uptodate").to_string()
                     } else {
-                        format!("{} update(s) available", state.modstore_updates.len())
+                        t!(
+                            "store.updates_available",
+                            count = state.modstore_updates.len()
+                        )
+                        .to_string()
                     };
                     state.notice_seq = state.notice_seq.wrapping_add(1);
                     return clear_notices_later(state.notice_seq);
@@ -1341,7 +1366,8 @@ impl DgrLauncher {
                 let instance = state.current_version.clone();
                 state.modstore_downloading = true;
                 state.modstore_update_confirm = None;
-                state.modstore_status = format!("Updating {}...", entry.title);
+                state.modstore_status =
+                    t!("store.updating", title = &entry.title).to_string();
                 return Task::perform(
                     async move { modrinth::install_mod(&instance, &detail, &version).await },
                     Message::ModInstallFinished,
@@ -1358,7 +1384,7 @@ impl DgrLauncher {
                     state.modstore_delete_confirm = None;
                     state.modstore_hovered_version = None;
                     state.modstore_deps_expanded = false;
-                    state.modstore_status = String::from("Loading mod page...");
+                    state.modstore_status = t!("store.loading_page").to_string();
                     return fetch_mod_page(prev);
                 }
                 state.screen = Screen::ModStore;
@@ -1432,7 +1458,7 @@ impl DgrLauncher {
                         state.current_version_info = describe_version(&new);
                         state.delete_confirm = None;
                         state.instance_name_edit = new;
-                        state.instance_settings_status = String::from("Renamed ✓");
+                        state.instance_settings_status = t!("instance.renamed").to_string();
                         state.notice_seq = state.notice_seq.wrapping_add(1);
                         return Task::batch(vec![
                             Task::perform(
@@ -1491,7 +1517,7 @@ impl DgrLauncher {
                     }
                     _ => {
                         state.instance_settings_status =
-                            String::from("Enter 0.5 – 32 (GiB).");
+                            t!("instance.ram_range").to_string();
                         state.notice_seq = state.notice_seq.wrapping_add(1);
                         return clear_notices_later(state.notice_seq);
                     }
@@ -1573,7 +1599,7 @@ impl DgrLauncher {
                 Task::none()
             }
             Message::InstanceLoaderReload => {
-                state.il_status = String::from("Loading loader versions...");
+                state.il_status = t!("instance.loading_loaders").to_string();
                 state.il_loader_list = Vec::new();
                 state.il_selected = String::new();
                 if version_kind(&state.current_version) == VersionKind::Fabric {
@@ -1594,15 +1620,17 @@ impl DgrLauncher {
                 if version_kind(&state.current_version) == VersionKind::Fabric {
                     if state.il_selected.is_empty() {
                         state.il_status =
-                            String::from("Select a Fabric loader version first.");
+                            t!("instance.select_fabric_first").to_string();
                         state.notice_seq = state.notice_seq.wrapping_add(1);
                         return clear_notices_later(state.notice_seq);
                     }
                     let base = instance_base_mc(&state.current_version);
                     let loader = state.il_selected.clone();
-                    state.il_status = format!(
-                        "Downloading Fabric {loader}... (progress on Installation screen)"
-                    );
+                    state.il_status = t!(
+                        "instance.downloading_fabric",
+                        loader = &loader
+                    )
+                    .to_string();
                     state.downloaders.push(Downloader::new(state.downloaders.len()));
                     let index = state.downloaders.len() - 1;
                     state.downloaders[index].start(
@@ -1618,9 +1646,7 @@ impl DgrLauncher {
                         state.il_selected.clone()
                     };
                     if nf.is_empty() {
-                        state.il_status = String::from(
-                            "Select a NeoForge version or enter it manually.",
-                        );
+                        state.il_status = t!("instance.select_neoforge_manual").to_string();
                         state.notice_seq = state.notice_seq.wrapping_add(1);
                         return clear_notices_later(state.notice_seq);
                     }
@@ -1630,14 +1656,14 @@ impl DgrLauncher {
                     // finishes, the selection moves to the new instance.
                     state.pending_loader_switch = Some(format!("neoforge-{nf}"));
                     state.il_status =
-                        String::from("Downloading Minecraft files first...");
+                        t!("instance.downloading_mc_first").to_string();
                     state.downloaders.push(Downloader::new(state.downloaders.len()));
                     let index = state.downloaders.len() - 1;
                     state.downloaders[index]
                         .start(mc, downloader::VersionType::Vanilla);
                     return Task::none();
                 }
-                state.il_status = String::from("No loader to switch on vanilla.");
+                state.il_status = t!("instance.no_loader_vanilla").to_string();
                 Task::none()
             }
 
@@ -1674,7 +1700,7 @@ impl DgrLauncher {
                         }
                     }
                     Screen::MicrosoftAccount => {
-                        state.auth_status = String::from("Getting code and link...");
+                        state.auth_status = t!("auth.getting_code").to_string();
                         Task::perform(
                             async move { auth::request_code().await },
                             Message::GotAuthCode,
@@ -1729,17 +1755,23 @@ impl DgrLauncher {
                 persist_current_java_name(&state.current_java_name);
                 Task::none()
             }
+            Message::LanguageChanged(code) => {
+                let code = i18n::sanitize_language(&code);
+                state.language = code.clone();
+                i18n::apply(&code);
+                persist_config_keys(&[("language", code)]);
+                Task::none()
+            }
             Message::ScanSystemJavas => {
-                state.java_scan_status = String::from("Scanning for installed Java...");
+                state.java_scan_status = t!("customjava.scanning").to_string();
                 Task::perform(system_java::scan_system_javas(), Message::GotSystemJavas)
             }
             Message::GotSystemJavas(found) => {
                 if found.is_empty() {
-                    state.java_scan_status =
-                        String::from("No Java installations found. Enter the path manually.");
+                    state.java_scan_status = t!("customjava.none_found").to_string();
                 } else {
                     state.java_scan_status =
-                        format!("Found {} Java installation(s).", found.len());
+                        t!("customjava.found", count = found.len()).to_string();
                 }
                 state.detected_javas = found;
                 Task::none()
@@ -1758,8 +1790,7 @@ impl DgrLauncher {
             }
             Message::SaveCustomJava => {
                 if state.custom_java_path.trim().is_empty() {
-                    state.java_scan_status =
-                        String::from("Enter a Java path or pick one from the scan results.");
+                    state.java_scan_status = t!("customjava.need_path").to_string();
                     return Task::none();
                 }
                 persist_custom_java(
@@ -1792,7 +1823,7 @@ impl DgrLauncher {
                     }
                     _ => {
                         state.settings_status =
-                            String::from("Enter 0.5 – 32 (GiB).");
+                            t!("settings.ram_range").to_string();
                     }
                 }
                 Task::none()
@@ -1869,8 +1900,8 @@ impl DgrLauncher {
                     }
                     LoaderChoice::NeoForge => {
                         if state.neoforge_all.is_empty() {
-                            state.neoforge_status =
-                                String::from("Loading NeoForge versions...");
+                        state.neoforge_status =
+                            t!("install.loading_neoforge").to_string();
                             return Task::perform(
                                 downloader::get_neoforge_versions(),
                                 Message::GotNeoForgeList,
@@ -1909,15 +1940,17 @@ impl DgrLauncher {
                         filter_neoforge_for_mc(state);
                     }
                     Err(err) => {
-                        state.neoforge_status = format!(
-                            "{err} (NeoForge Maven is unreachable; enter the version manually)"
+                        state.neoforge_status = t!(
+                            "install.neoforge_unreachable",
+                            err = err.to_string()
                         )
+                        .to_string()
                     }
                 }
                 Task::none()
             }
             Message::ReloadNeoForgeList => {
-                state.neoforge_status = String::from("Loading NeoForge versions...");
+                state.neoforge_status = t!("install.loading_neoforge").to_string();
                 Task::perform(
                     downloader::get_neoforge_versions(),
                     Message::GotNeoForgeList,
@@ -1953,7 +1986,7 @@ impl DgrLauncher {
                 // A manual install cancels a pending loader switch target.
                 state.pending_loader_switch = None;
                 if state.install_mc_version.is_empty() {
-                    state.download_text = String::from("Select a Minecraft version first.");
+                    state.download_text = t!("install.select_mc_first").to_string();
                     state.notice_seq = state.notice_seq.wrapping_add(1);
                     return clear_notices_later(state.notice_seq);
                 }
@@ -1993,7 +2026,7 @@ impl DgrLauncher {
                     LoaderChoice::Fabric => {
                         if state.fabric_loader_selected.is_empty() {
                             state.download_text =
-                                String::from("Select a Fabric loader version first.");
+                                t!("install.select_fabric_first").to_string();
                             state.notice_seq = state.notice_seq.wrapping_add(1);
                             return clear_notices_later(state.notice_seq);
                         }
@@ -2015,9 +2048,8 @@ impl DgrLauncher {
                             state.neoforge_selected.clone()
                         };
                         if nf.is_empty() {
-                            state.neoforge_status = String::from(
-                                "Select a NeoForge version or enter it manually.",
-                            );
+                            state.neoforge_status =
+                                t!("install.select_neoforge_manual").to_string();
                             state.notice_seq = state.notice_seq.wrapping_add(1);
                             return clear_notices_later(state.notice_seq);
                         }
@@ -2026,9 +2058,8 @@ impl DgrLauncher {
                         // Remember the target through the whole chain
                         // (vanilla prefetch -> installer -> optional java).
                         state.pending_neoforge_install = Some((mc.clone(), nf));
-                        state.neoforge_status = String::from(
-                            "Downloading Minecraft files first...",
-                        );
+                        state.neoforge_status =
+                            t!("install.downloading_mc_first").to_string();
                         // Prefetch vanilla files so the game doesn't have to
                         // download them on first launch; when this flow
                         // finishes, the installer starts (see Finished).
@@ -2045,7 +2076,7 @@ impl DgrLauncher {
                 match progress {
                     downloader::Progress::GotDownloadList(file_number) => {
                         state.download_text =
-                            format!("Downloaded 0 from {} files. (0%)", file_number);
+                            t!("install.progress_start", total = file_number).to_string();
                         state.files_download_number = file_number;
                     }
                     downloader::Progress::Downloaded(remaining_files_number) => {
@@ -2053,10 +2084,13 @@ impl DgrLauncher {
                         let percentage = (downloaded_files as f32
                             / state.files_download_number as f32
                             * 100.0) as i32;
-                        state.download_text = format!(
-                            "Downloaded {} from {} files. ({}%)",
-                            downloaded_files, state.files_download_number, percentage
-                        );
+                        state.download_text = t!(
+                            "install.progress",
+                            done = downloaded_files,
+                            total = state.files_download_number,
+                            pct = percentage
+                        )
+                        .to_string();
                     }
                     downloader::Progress::Finished => {
                         // Which version dir just finished? (MC id vs
@@ -2067,7 +2101,7 @@ impl DgrLauncher {
                             .find(|d| d.id == id)
                             .and_then(|d| finished_version_dir_id(&d.state));
                         state.download_text =
-                            String::from("Version installed successfully.");
+                            t!("install.installed_ok").to_string();
                         for (index, downloader) in state.downloaders.iter().enumerate() {
                             if downloader.id == id {
                                 state.downloaders.remove(index);
@@ -2090,15 +2124,19 @@ impl DgrLauncher {
                                     &custom,
                                 ) {
                                     Ok(()) => {
-                                        state.download_text = format!(
-                                            "Version installed as {custom}."
-                                        );
+                                        state.download_text = t!(
+                                            "install.installed_as",
+                                            name = &custom
+                                        )
+                                        .to_string();
                                         refresh = true;
                                     }
                                     Err(e) => {
-                                        state.download_text = format!(
-                                            "Installed, but rename failed: {e}"
-                                        );
+                                        state.download_text = t!(
+                                            "install.rename_failed",
+                                            err = e.to_string()
+                                        )
+                                        .to_string();
                                     }
                                 }
                             }
@@ -2125,8 +2163,10 @@ impl DgrLauncher {
                         return Task::batch(done_tasks);
                     }
                     downloader::Progress::Errored(error) => {
-                        state.download_text = format!("Failed to install: {error}");
-                        state.neoforge_status = format!("Failed to install: {error}");
+                        state.download_text =
+                            t!("install.install_failed", err = &error).to_string();
+                        state.neoforge_status =
+                            t!("install.install_failed", err = &error).to_string();
                         state.restrict_launch = false;
                         state.pending_neoforge_install = None;
                         for (index, downloader) in state.downloaders.iter().enumerate() {
@@ -2140,20 +2180,24 @@ impl DgrLauncher {
                     }
                     downloader::Progress::StartedJavaDownload(size) => {
                         state.restrict_launch = true;
-                        state.game_state_text = format!("Downloading java. 0 / {size} MiB (0%)");
+                        state.game_state_text =
+                            t!("launch.java_start", total = size).to_string();
                         state.java_download_size = size;
                     }
                     downloader::Progress::JavaDownloadProgressed(downloaded, percentage) => {
-                        state.game_state_text = format!(
-                            "Downloading Java. {downloaded} / {} MiB ({percentage}%)",
-                            state.java_download_size
+                        state.game_state_text = t!(
+                            "launch.java_progress",
+                            done = downloaded,
+                            total = state.java_download_size,
+                            pct = percentage
                         )
+                        .to_string()
                     }
                     downloader::Progress::JavaDownloadFinished => {
-                        state.game_state_text = String::from("Extracting Java")
+                        state.game_state_text = t!("launch.extracting_java").to_string()
                     }
                     downloader::Progress::JavaExtracted => {
-                        state.game_state_text = String::from("Java was installed successfully.");
+                        state.game_state_text = t!("launch.java_ok").to_string();
                         state.restrict_launch = false;
                         for (index, downloader) in state.downloaders.iter().enumerate() {
                             if downloader.id == id {
@@ -2173,9 +2217,11 @@ impl DgrLauncher {
                         state.launch();
                     }
                     downloader::Progress::NeoForgeNeedsJava(major) => {
-                        state.neoforge_status = format!(
-                            "Java {major} is required to run the installer. Downloading it first..."
-                        );
+                        state.neoforge_status = t!(
+                            "launch.neoforge_needs_java",
+                            major = major
+                        )
+                        .to_string();
                         state.restrict_launch = true;
                         state.downloaders.push(Downloader {
                             state: DownloaderState::Idle,
@@ -2207,12 +2253,12 @@ impl DgrLauncher {
                             state.current_version_info = describe_version(&new_id);
                             state.delete_confirm = None;
                             state.il_status =
-                                format!("Switched to {new_id}.");
+                                t!("instance.switched_to", id = &new_id).to_string();
                         }
                         state.neoforge_status =
-                            String::from("NeoForge installed successfully.");
+                            t!("install.neoforge_ok").to_string();
                         state.download_text =
-                            String::from("NeoForge installed successfully.");
+                            t!("install.neoforge_ok").to_string();
                         if let Some(nf) = finished_nf {
                             let old_id = format!("neoforge-{nf}");
                             if let Some(pos) = state
@@ -2228,14 +2274,18 @@ impl DgrLauncher {
                                     &custom,
                                 ) {
                                     Ok(()) => {
-                                        state.download_text = format!(
-                                            "NeoForge installed as {custom}."
-                                        );
+                                        state.download_text = t!(
+                                            "install.neoforge_ok_as",
+                                            name = &custom
+                                        )
+                                        .to_string();
                                     }
                                     Err(e) => {
-                                        state.download_text = format!(
-                                            "Installed, but rename failed: {e}"
-                                        );
+                                        state.download_text = t!(
+                                            "install.rename_failed",
+                                            err = e.to_string()
+                                        )
+                                        .to_string();
                                     }
                                 }
                             }
@@ -2258,7 +2308,7 @@ impl DgrLauncher {
                     downloader::Progress::MissingFilesDownloadProgressed(missing_files) => {
                         state.restrict_launch = true;
                         state.game_state_text =
-                            format!("Downloading missing files. {} left", missing_files);
+                            t!("launch.missing_left", left = missing_files).to_string();
                     }
                     downloader::Progress::MissingFilesDownloadFinished => {
                         state.restrict_launch = false;
@@ -2271,12 +2321,17 @@ impl DgrLauncher {
                         state.launch();
                     }
                     downloader::Progress::UpdateStarted(total) => {
-                        state.update_text = format!("Downloading update. 0 / {total} MiB (0%)")
+                        state.update_text =
+                            t!("launch.update_start", total = total).to_string()
                     }
                     downloader::Progress::UpdateProgressed(downloaded, percentage, total) => {
-                        state.update_text = format!(
-                            "Downloading update. {downloaded} / {total} MiB ({percentage}%)"
+                        state.update_text = t!(
+                            "launch.update_progress",
+                            done = downloaded,
+                            total = total,
+                            pct = percentage
                         )
+                        .to_string()
                     }
                     downloader::Progress::UpdateFinished => {
                         for (index, downloader) in state.downloaders.iter().enumerate() {
@@ -2288,20 +2343,31 @@ impl DgrLauncher {
                         let exec_path = match env::current_exe() {
                             Ok(p) => p,
                             Err(e) => {
-                                state.update_text =
-                                    format!("Update failed: cannot locate executable: {e}");
+                                state.update_text = t!(
+                                    "launch.update_fail_locate",
+                                    err = e.to_string()
+                                )
+                                .to_string();
                                 return Task::none();
                             }
                         };
                         let old_path = exec_path.with_extension("old");
                         let new_path = exec_path.with_extension("new");
                         if let Err(e) = fs::rename(&exec_path, &old_path) {
-                            state.update_text = format!("Update failed (backup step): {e}");
+                            state.update_text = t!(
+                                "launch.update_fail_backup",
+                                err = e.to_string()
+                            )
+                            .to_string();
                             return Task::none();
                         }
                         if let Err(e) = fs::rename(&new_path, &exec_path) {
                             let _ = fs::rename(&old_path, &exec_path);
-                            state.update_text = format!("Update failed (replace step): {e}");
+                            state.update_text = t!(
+                                "launch.update_fail_replace",
+                                err = e.to_string()
+                            )
+                            .to_string();
                             return Task::none();
                         }
                         #[cfg(target_os = "linux")]
@@ -2313,12 +2379,15 @@ impl DgrLauncher {
                                 let _ = fs::set_permissions(&exec_path, perm);
                             }
                         }
-                        state.update_text = String::from("Update installed successfully.");
+                        state.update_text = t!("launch.update_ok").to_string();
                         match std::process::Command::new(&exec_path).spawn() {
                             Ok(_) => std::process::exit(0),
                             Err(e) => {
-                                state.update_text =
-                                    format!("Updated, but failed to restart: {e}");
+                                state.update_text = t!(
+                                    "launch.update_restart_fail",
+                                    err = e.to_string()
+                                )
+                                .to_string();
                             }
                         }
                     }
@@ -2327,10 +2396,9 @@ impl DgrLauncher {
             }
             Message::VanillaJson(result) => {
                 if result.is_null() {
-                    state.game_state_text =
-                        String::from("Json download failed. Check your internet connection.");
+                    state.game_state_text = t!("launch.json_fail").to_string();
                 } else {
-                    state.game_state_text = String::from("Json downloaded successfully.");
+                    state.game_state_text = t!("launch.json_ok").to_string();
                 }
                 state.launch();
                 Task::none()
@@ -2383,7 +2451,7 @@ impl DgrLauncher {
             Message::RecheckUpdates => {
                 state.update_available = false;
                 state.update_text = String::new();
-                state.last_version = String::from("Checking for updates...");
+                state.last_version = t!("launch.checking_updates").to_string();
                 return Task::perform(
                     update_manager::check_launcher_updates(),
                     Message::CheckedUpdates,
@@ -2399,7 +2467,7 @@ impl DgrLauncher {
                 Task::none()
             }
             Message::GotAuthCode(code) => {
-                state.auth_status = String::from("Waiting for login...");
+                state.auth_status = t!("auth.waiting_login").to_string();
                 state.auth_code = code;
                 Task::none()
             }
@@ -2407,7 +2475,7 @@ impl DgrLauncher {
                 match progress {
                     auth::WaitProgress::GotAuthToken(auth_token) => {
                         state.auth_token = auth_token.clone();
-                        state.auth_status = String::from("Logging into Xbox Services...");
+                        state.auth_status = t!("auth.logging_xbox").to_string();
                         return Task::perform(
                             async move { auth::login_to_xbox(auth_token.access_token).await },
                             Message::GotXboxToken,
@@ -2423,7 +2491,7 @@ impl DgrLauncher {
             }
             Message::GotXboxToken(xbox_data) => {
                 state.auth_xbox_data = xbox_data.clone();
-                state.auth_status = String::from("Logging into Minecraft...");
+                state.auth_status = t!("auth.logging_mc").to_string();
                 Task::perform(
                     async move { auth::login_to_minecraft(xbox_data).await },
                     Message::GotMinecraftAuthData,
@@ -2439,7 +2507,7 @@ impl DgrLauncher {
                 state.accounts = save_account(account.clone());
                 state.current_account = account;
                 persist_current_account(&state.current_account);
-                state.auth_status = String::from("Account added successfully!");
+                state.auth_status = t!("auth.account_added").to_string();
                 if state.screen == Screen::MicrosoftAccount{
                     state.screen = Screen::Accounts;
                 }
@@ -2462,7 +2530,7 @@ impl DgrLauncher {
                     state.current_account_mc_data = mc_account;
                 } else{
                     state.current_account_mc_data.username = state.current_account.username.clone();
-                    state.game_state_text_2 = String::from("Game will run in offline mode. Check your internet connection.");
+                    state.game_state_text_2 = t!("launch.offline_mode").to_string();
                 }
                 state.launch();
                 Task::none()
@@ -2549,7 +2617,7 @@ impl DgrLauncher {
                     .style(theme::transparent_button)
                     .width(Length::Fixed(42.))
                     .height(Length::Fixed(42.)),
-                    "Main Screen"
+                    t!("nav.main")
                 ),
 
                 space::vertical().height(Length::Fill),
@@ -2561,7 +2629,7 @@ impl DgrLauncher {
                     .style(theme::transparent_button)
                     .width(Length::Fixed(42.))
                     .height(Length::Fixed(42.)),
-                    "Account (WIP)"
+                    t!("nav.accounts")
                 ),
                 action(
                     button(svg(svg::Handle::from_memory(
@@ -2571,7 +2639,7 @@ impl DgrLauncher {
                     .style(theme::transparent_button)
                     .width(Length::Fixed(42.))
                     .height(Length::Fixed(42.)),
-                    "Settings"
+                    t!("nav.settings")
                 ),
             ]
             .spacing(12)
@@ -2615,11 +2683,12 @@ impl DgrLauncher {
         };
         Subscription::batch(subscriptions)
     }
-fn action<'a>(
-    widget: Button<'a, Message, Theme, Renderer>,
-    tp_text: &'a str,
-) -> Element<'a, Message> {
-    tooltip(widget, tp_text, tooltip::Position::Right)
+fn action(
+    widget: Button<'_, Message, Theme, Renderer>,
+    tp_text: impl Into<String>,
+) -> Element<'_, Message> {
+    let tip: String = tp_text.into();
+    tooltip(widget, text(tip), tooltip::Position::Right)
         .style(theme::black_container)
         .padding(10)
         .into()
@@ -2692,6 +2761,14 @@ fn checksettingsfile() -> bool {
             map.insert(
                 "show_all_versions".to_owned(),
                 serde_json::to_value(false).unwrap(),
+            );
+        }
+        if !map.contains_key("language") {
+            // First launch (or pre-i18n config): auto-detect once from the
+            // OS locale, then it only changes manually in Settings.
+            map.insert(
+                "language".to_owned(),
+                serde_json::to_value(i18n::detect_system_language()).unwrap(),
             );
         }
     }
@@ -2836,10 +2913,10 @@ fn describe_version(id: &str) -> String {
     };
     if let Some(mc) = v["inheritsFrom"].as_str() {
         let loader = match version_kind(id) {
-            VersionKind::Fabric => "Fabric",
-            VersionKind::NeoForge => "NeoForge",
-            VersionKind::Forge => "Forge",
-            _ => "Modded",
+            VersionKind::Fabric => String::from("Fabric"),
+            VersionKind::NeoForge => String::from("NeoForge"),
+            VersionKind::Forge => String::from("Forge"),
+            _ => t!("main.loader_modded").to_string(),
         };
         format!("Minecraft {mc} \u{2022} {loader}")
     } else {
@@ -2862,10 +2939,11 @@ fn filter_neoforge_for_mc(state: &mut DgrLauncher) {
         .unwrap_or_default();
     state.neoforge_manual = String::new();
     if state.neoforge_versions_for_mc.is_empty() && !state.install_mc_version.is_empty() {
-        state.neoforge_status = format!(
-            "No NeoForge found for {}. Enter the version manually.",
-            state.install_mc_version
-        );
+        state.neoforge_status = t!(
+            "install.none_found_for_mc",
+            mc = &state.install_mc_version
+        )
+        .to_string();
     } else if !state.neoforge_all.is_empty() {
         state.neoforge_status = String::new();
     }
@@ -3176,19 +3254,17 @@ fn game_instance_dir_for_version(version: &str) -> String {
 pub fn valid_new_instance_name(mc_dir: &str, new: &str) -> Result<(), String> {
     if new.is_empty() || new == "." || new == ".." || new.contains('/') || new.contains('\\')
     {
-        return Err(String::from("Invalid name."));
+        return Err(t!("install.invalid_name").to_string());
     }
     if Path::new(&format!("{mc_dir}/versions/{new}")).exists() {
-        return Err(String::from(
-            "A version with this name already exists.",
-        ));
+        return Err(t!("install.name_taken").to_string());
     }
     Ok(())
 }
 pub fn rename_instance(mc_dir: &str, old: &str, new: &str) -> Result<(), String> {
     valid_new_instance_name(mc_dir, new)?;
     if new == old {
-        return Err(String::from("Same name, nothing to do."));
+        return Err(t!("install.same_name").to_string());
     }
     let rollback_dir = || {
         let _ = fs::rename(

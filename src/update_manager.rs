@@ -2,6 +2,7 @@ use reqwest::header::{HeaderValue, USER_AGENT};
 use serde_json::Value;
 use std::env;
 use std::time::Duration;
+use rust_i18n::t;
 const REPO: &str = "VLAZOF/dgrlauncher";
 fn api_url() -> String {
     format!("https://api.github.com/repos/{REPO}/releases/latest")
@@ -29,7 +30,7 @@ pub async fn check_launcher_updates() -> Result<(String, String), String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+        .map_err(|e| t!("upd.http_client", err = e.to_string()).to_string())?;
     let mut request = client
         .get(api_url())
         .header(USER_AGENT, HeaderValue::from_static("dgrlauncher"));
@@ -44,37 +45,34 @@ pub async fn check_launcher_updates() -> Result<(String, String), String> {
     let response = request
         .send()
         .await
-        .map_err(|e| format!("Failed to check for updates: {e}"))?;
+        .map_err(|e| t!("upd.check_fail", err = e.to_string()).to_string())?;
     if !response.status().is_success() {
-        return Err(format!(
-            "Update check failed: HTTP {}",
-            response.status()
-        ));
+        return Err(t!("upd.http_status", status = response.status()).to_string());
     }
     let text = response
         .text()
         .await
-        .map_err(|e| format!("Failed to read response: {e}"))?;
+        .map_err(|e| t!("upd.read_response", err = e.to_string()).to_string())?;
     let release: Value =
-        serde_json::from_str(&text).map_err(|e| format!("Failed to read json: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| t!("upd.read_json", err = e.to_string()).to_string())?;
     let latest_tag = release["tag_name"]
         .as_str()
-        .ok_or_else(|| "Release has no tag_name.".to_string())?;
+        .ok_or_else(|| t!("upd.no_tag").to_string())?;
     let current_version = env!("CARGO_PKG_VERSION");
     let current = parse_version(current_version)
-        .ok_or_else(|| "Failed to parse current version number.".to_string())?;
+        .ok_or_else(|| t!("upd.parse_current").to_string())?;
     let latest = parse_version(latest_tag)
-        .ok_or_else(|| "Failed to parse latest version number.".to_string())?;
+        .ok_or_else(|| t!("upd.parse_latest").to_string())?;
     if latest <= current {
-        return Err("Your DgrLauncher is updated!".to_string());
+        return Err(t!("upd.uptodate").to_string());
     }
     let assets = release["assets"]
         .as_array()
-        .ok_or_else(|| "Release has no assets.".to_string())?;
+        .ok_or_else(|| t!("upd.no_assets").to_string())?;
     let (want_substr, want_ext) = match env::consts::OS {
         "windows" => ("windows", ".zip"),
         "linux" => ("linux", ".tar.gz"),
-        other => return Err(format!("System not supported: {other}")),
+        other => return Err(t!("upd.os_unsupported", os = other).to_string()),
     };
     let mut url: Option<String> = None;
     for pass in 0..2 {
@@ -98,10 +96,12 @@ pub async fn check_launcher_updates() -> Result<(String, String), String> {
     }
     match url {
         Some(url) => Ok((url, latest_tag.to_string())),
-        None => Err(format!(
-            "No update asset for your OS ({}) in release {latest_tag}.",
-            env::consts::OS
-        )),
+        None => Err(t!(
+            "upd.no_asset",
+            os = env::consts::OS,
+            tag = latest_tag
+        )
+        .to_string()),
     }
 }
 #[cfg(test)]

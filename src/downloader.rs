@@ -10,6 +10,7 @@ use std::{
     path::Path,
 };
 use zip::ZipArchive;
+use rust_i18n::t;
 pub enum State {
     GettingDownloadList(String, VersionType),
     Downloading(DownloadList),
@@ -327,7 +328,7 @@ pub async fn get_fabric_loader_versions(mc_version: &str) -> Result<Vec<String>,
         }
     }
     if loaders.is_empty() {
-        return Err(format!("No Fabric loader for {mc_version}"));
+        return Err(t!("dl.no_fabric", mc = mc_version).to_string());
     }
     Ok(loaders)
 }
@@ -579,7 +580,7 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
                 return (
                     (
                         id,
-                        Progress::NeoForgeStatus(String::from("Running NeoForge installer...")),
+                        Progress::NeoForgeStatus(t!("dl.neoforge_running").to_string()),
                     ),
                     State::RunningNeoForgeInstaller {
                         mc_version,
