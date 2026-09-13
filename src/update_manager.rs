@@ -1,9 +1,17 @@
 use reqwest::header::{HeaderValue, USER_AGENT};
 use serde_json::Value;
 use std::env;
+use std::sync::LazyLock;
 use std::time::Duration;
 use rust_i18n::t;
 const REPO: &str = "VLAZOF/dgrlauncher";
+/// Shared client (one pool, update checks included).
+static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
 fn api_url() -> String {
     format!("https://api.github.com/repos/{REPO}/releases/latest")
 }
@@ -27,10 +35,7 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 pub async fn check_launcher_updates() -> Result<(String, String, String), String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| t!("upd.http_client", err = e.to_string()).to_string())?;
+    let client = HTTP.clone();
     let mut request = client
         .get(api_url())
         .header(USER_AGENT, HeaderValue::from_static("dgrlauncher"));

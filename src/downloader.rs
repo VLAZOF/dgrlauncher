@@ -6,11 +6,15 @@ use std::{
     env,
     fs::{self, File},
     hash::Hash,
-    io::{BufReader, Read, Write},
+    io::{BufReader, Write},
     path::Path,
+    sync::LazyLock,
 };
 use zip::ZipArchive;
 use rust_i18n::t;
+/// Shared HTTP client: one connection pool per process instead of a
+/// fresh `Client::new()` per request (fewer TLS handshakes, fewer sockets).
+static HTTP: LazyLock<Client> = LazyLock::new(Client::new);
 pub enum State {
     GettingDownloadList(String, VersionType),
     Downloading(DownloadList),
@@ -156,8 +160,8 @@ pub fn start_missing_files<I: 'static + Hash + Copy + Send + Sync>(
         let (id, files) = data.clone();
         stream::channel(100, async move |mut output| {
             let mut state = State::DownloadingMissingFiles(DownloadList {
-                download_list: files,
-                client: Client::new(),
+                download_list: files.into(),
+                client: HTTP.clone(),
             });
             loop {
                 match state {
@@ -266,7 +270,7 @@ pub fn neoforge_mc_of_version(version: &str) -> Option<String> {
 /// Full NeoForge version list from Maven metadata (latest first).
 /// Returns `(minecraft_version, neoforge_version)` pairs.
 pub async fn get_neoforge_versions() -> Result<Vec<(String, String)>, String> {
-    let text = match Client::new()
+    let text = match HTTP
         .get("https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml")
         .send()
         .await
@@ -302,7 +306,7 @@ pub async fn get_neoforge_versions() -> Result<Vec<(String, String)>, String> {
 }
 /// Fabric loader versions for a Minecraft version (latest first).
 pub async fn get_fabric_loader_versions(mc_version: &str) -> Result<Vec<String>, String> {
-    let text = match Client::new()
+    let text = match HTTP
         .get(format!(
             "https://meta.fabricmc.net/v2/versions/loader/{mc_version}"
         ))
@@ -334,7 +338,10 @@ pub async fn get_fabric_loader_versions(mc_version: &str) -> Result<Vec<String>,
 }
 #[derive(Clone)]
 pub struct DownloadList {
-    pub download_list: Vec<Download>,
+    /// Files still to fetch (front = next). A queue: popping the front
+    /// is O(1) and never clones the remainder (the old `Vec` + `clone()`
+    /// + `remove(0)` copied every pending entry per file).
+    pub download_list: std::collections::VecDeque<Download>,
     pub client: Client,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -342,64 +349,180 @@ pub struct Download {
     pub path: String,
     pub url: String,
 }
+/// Stream a URL straight to disk chunk by chunk: memory stays O(chunk)
+/// no matter the file size (the old `.bytes()` held the whole file in
+/// RAM). Parent folders are created, so nested library paths never fail
+/// with "no such directory".
+async fn stream_to_file(client: &Client, url: &str, path: &str) -> Result<(), String> {
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {e}"))?;
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| format!("Folder failed: {e}"))?;
+    }
+    let mut file = File::create(path).map_err(|e| format!("File create failed: {e}"))?;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("Download read failed: {e}"))?
+    {
+        file.write_all(&chunk)
+            .map_err(|e| format!("File write failed: {e}"))?;
+    }
+    Ok(())
+}
+/// Unpack a downloaded `natives.jar` into its sibling folder and remove
+/// the jar (the game loads extracted natives, not the archive).
+fn extract_natives(jar_path: &str) -> Result<(), String> {
+    let natives_file =
+        File::open(jar_path).map_err(|e| format!("Natives open failed: {e}"))?;
+    let mut archive = ZipArchive::new(BufReader::new(natives_file))
+        .map_err(|e| format!("Natives zip broken: {e}"))?;
+    let folder = jar_path.replace("/natives.jar", "");
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Natives entry broken: {e}"))?;
+        let outpath = format!("{folder}/{}", entry.mangled_name().to_string_lossy());
+        if entry.is_dir() {
+            println!("Creating directory: {:?}", outpath);
+            std::fs::create_dir_all(&outpath)
+                .map_err(|e| format!("Natives folder failed: {e}"))?;
+        } else {
+            println!("Extracting file: {:?}", outpath);
+            let mut outfile =
+                File::create(&outpath).map_err(|e| format!("Natives file failed: {e}"))?;
+            std::io::copy(&mut entry, &mut outfile)
+                .map_err(|e| format!("Natives extract failed: {e}"))?;
+        }
+    }
+    fs::remove_file(jar_path).map_err(|e| format!("Natives cleanup failed: {e}"))?;
+    Ok(())
+}
 async fn download<I: 'static + Hash + Copy + Send + Sync>(
     id: I,
     state: State,
 ) -> ((I, Progress), State) {
     match state {
         State::GettingDownloadList(version, version_type) => {
-            let mc_dir = match std::env::consts::OS {
-                "linux" => format!("{}/.minecraft", std::env::var("HOME").unwrap()),
-                "windows" => format!(
-                    "{}/AppData/Roaming/.minecraft",
-                    std::env::var("USERPROFILE").unwrap().replace('\\', "/")
-                ),
-                _ => panic!("System not supported."),
-            };
+            let mc_dir = super::launcher::get_minecraft_dir();
             let version_name = match &version_type {
                 VersionType::Vanilla => version.clone(),
                 VersionType::Fabric { .. } => format!("{}-fabric", &version),
             };
             let version_folder = format!("{}/versions/{}", &mc_dir, version_name);
-            let client = Client::new();
+            let client = HTTP.clone();
             let vanilla_version_json = match &version_type {
                 VersionType::Vanilla => {
                     match downloadversionjson(&version_type, &version, &version_folder, &client)
                         .await
                     {
                         Ok(json) => json,
-                        Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
+                        Err(e) => return ((id, Progress::Errored(e)), State::Idle),
                     }
                 }
                 VersionType::Fabric { .. } => {
-                    match downloadversionjson(&version_type, &version, &version_folder, &client)
-                        .await
+                    // The helper saves vanilla json as `{mc}.json` and the
+                    // loader profile as `{mc}-fabric.json`, returning the
+                    // loader profile: re-read the vanilla one for assets
+                    // and the client jar below.
+                    if let Err(e) = downloadversionjson(
+                        &version_type,
+                        &version,
+                        &version_folder,
+                        &client,
+                    )
+                    .await
                     {
-                        Ok(json) => json,
-                        Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
+                        return ((id, Progress::Errored(e)), State::Idle);
+                    }
+                    let vanilla_path = format!("{}/{}.json", version_folder, version);
+                    let content = match fs::read_to_string(&vanilla_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            return (
+                                (
+                                    id,
+                                    Progress::Errored(format!(
+                                        "Version file unreadable: {e}"
+                                    )),
+                                ),
+                                State::Idle,
+                            )
+                        }
                     };
-                    let mut file =
-                        File::open(format!("{}/{}.json", version_folder, version)).unwrap();
-                    let mut fcontent = String::new();
-                    file.read_to_string(&mut fcontent).unwrap();
-                    let content = serde_json::from_str(&fcontent);
-                    content.unwrap()
+                    match serde_json::from_str(&content) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return (
+                                (
+                                    id,
+                                    Progress::Errored(format!("Version file corrupt: {e}")),
+                                ),
+                                State::Idle,
+                            )
+                        }
+                    }
                 }
             };
             let version_json = super::getjson(format!("{}/{}.json", version_folder, version_name));
-            let asset_index_download = match client
-                .get(vanilla_version_json["assetIndex"]["url"].as_str().unwrap())
-                .send()
-                .await
-            {
-                Ok(ok) => ok.bytes().await.unwrap(),
-                Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
+            let asset_url = match vanilla_version_json["assetIndex"]["url"].as_str() {
+                Some(u) => u.to_owned(),
+                None => {
+                    return (
+                        (
+                            id,
+                            Progress::Errored(
+                                "Version metadata has no asset index.".to_owned(),
+                            ),
+                        ),
+                        State::Idle,
+                    )
+                }
             };
-            let asset_index_path = format!(
-                "{}/assets/indexes/{}.json",
-                mc_dir,
-                vanilla_version_json["assets"].as_str().unwrap()
-            );
+            let asset_index_download = match client.get(asset_url).send().await {
+                Ok(ok) => match ok.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return (
+                            (
+                                id,
+                                Progress::Errored(format!("Asset index read failed: {e}")),
+                            ),
+                            State::Idle,
+                        )
+                    }
+                },
+                Err(e) => {
+                    return (
+                        (
+                            id,
+                            Progress::Errored(format!("Asset index download failed: {e}")),
+                        ),
+                        State::Idle,
+                    )
+                }
+            };
+            let assets_name = match vanilla_version_json["assets"].as_str() {
+                Some(a) => a.to_owned(),
+                None => {
+                    return (
+                        (
+                            id,
+                            Progress::Errored(
+                                "Version metadata has no assets index.".to_owned(),
+                            ),
+                        ),
+                        State::Idle,
+                    )
+                }
+            };
+            let asset_index_path =
+                format!("{}/assets/indexes/{}.json", mc_dir, assets_name);
             match fs::create_dir_all(format!("{}/assets/indexes", mc_dir)) {
                 Ok(ok) => ok,
                 Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
@@ -417,127 +540,99 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
             // The per-version client jar copy is required for vanilla and
             // Fabric (Knot locates the game through it). NeoForge installs
             // via its own installer flow and never reaches this code.
+            let client_jar_url = match vanilla_version_json["downloads"]["client"]["url"]
+                .as_str()
+            {
+                Some(u) => u.to_owned(),
+                None => {
+                    return (
+                        (
+                            id,
+                            Progress::Errored(
+                                "Version metadata has no client jar.".to_owned(),
+                            ),
+                        ),
+                        State::Idle,
+                    )
+                }
+            };
             download_list.push(Download {
                 path: format!("{}/{}.jar", version_folder, version_name),
-                url: vanilla_version_json["downloads"]["client"]["url"]
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
+                url: client_jar_url,
             });
             match get_assets(&mc_dir, asset_index_json) {
                 Ok(ok) => download_list.extend_from_slice(&ok),
                 Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
             }
-            let libresult = &get_libraries(
-                &mc_dir,
-                vanilla_version_json["libraries"].as_array().unwrap(),
-                &version_folder,
-            );
-            let libraries = match libresult {
+            let Some(vanilla_libs) = vanilla_version_json["libraries"].as_array() else {
+                return (
+                    (
+                        id,
+                        Progress::Errored("Version metadata has no libraries.".to_owned()),
+                    ),
+                    State::Idle,
+                );
+            };
+            let libraries = match get_libraries(&mc_dir, vanilla_libs, &version_folder) {
                 Ok(ok) => ok,
                 Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
             };
-            download_list.extend_from_slice(libraries);
+            download_list.extend_from_slice(&libraries);
             if matches!(version_type, VersionType::Fabric { .. }) {
-                let libresult = &get_libraries(
-                    &mc_dir,
-                    version_json["libraries"].as_array().unwrap(),
-                    &version_folder,
-                );
-                let libraries = match libresult {
+                let Some(loader_libs) = version_json["libraries"].as_array() else {
+                    return (
+                        (
+                            id,
+                            Progress::Errored(
+                                "Loader profile has no libraries.".to_owned(),
+                            ),
+                        ),
+                        State::Idle,
+                    );
+                };
+                let libraries = match get_libraries(&mc_dir, loader_libs, &version_folder)
+                {
                     Ok(ok) => ok,
                     Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
                 };
-                download_list.extend_from_slice(libraries);
+                download_list.extend_from_slice(&libraries);
             }
-            let mut filtered_download_list = Vec::new();
-            for i in download_list {
-                if !Path::new(&i.path).exists() {
-                    filtered_download_list.push(i)
-                }
-            }
+            // Only what is missing hits the network; the queue owns the
+            // remainder without per-file cloning.
+            let queue: std::collections::VecDeque<Download> = download_list
+                .into_iter()
+                .filter(|i| !Path::new(&i.path).exists())
+                .collect();
             (
-                (
-                    id,
-                    Progress::GotDownloadList(filtered_download_list.len() as i32),
-                ),
+                (id, Progress::GotDownloadList(queue.len() as i32)),
                 State::Downloading(DownloadList {
-                    download_list: filtered_download_list,
+                    download_list: queue,
                     client,
                 }),
             )
         }
-        State::Downloading(download_list) => {
-            if download_list.download_list.is_empty() {
+        State::Downloading(mut download_list) => {
+            let Some(current) = download_list.download_list.pop_front() else {
                 println!("finished");
                 return ((id, Progress::Finished), State::Idle);
-            }
-            let mut list = download_list.download_list.clone();
-            let current_file_to_download = list.remove(0);
-            println!("Downloading {}", current_file_to_download.path);
-            let current_download = match download_list
-                .client
-                .get(current_file_to_download.url)
-                .send()
-                .await
+            };
+            println!("Downloading {}", current.path);
+            if let Err(e) =
+                stream_to_file(&download_list.client, &current.url, &current.path).await
             {
-                Ok(ok) => ok.bytes().await.unwrap(),
-                Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
-            };
-            let path = Path::new(&current_file_to_download.path);
-            let mut path_vec  = vec![];
-            for i in path.components(){
-                path_vec.push(i.as_os_str().to_string_lossy())
+                return ((id, Progress::Errored(e)), State::Idle);
             }
-            if path_vec.len() > 1{
-                path_vec.pop();
-                let dir = path_vec.join("/");
-                if !Path::new(&dir).exists(){
-                    match fs::create_dir_all(dir){
-                        Ok(ok) => ok,
-                        Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
-                    }
-                }
+            if current.path.contains("natives.jar") && let Err(e) = extract_natives(&current.path)
+            {
+                return ((id, Progress::Errored(e)), State::Idle);
             }
-            let mut file = match File::create(&current_file_to_download.path) {
-                Ok(file) => file,
-                Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
-            };
-            match file.write_all(&current_download) {
-                Ok(ok) => ok,
-                Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
-            }
-            if current_file_to_download.path.contains("natives.jar") {
-                let nativesfile = File::open(&current_file_to_download.path).unwrap();
-                let reader = BufReader::new(nativesfile);
-                let mut archive = ZipArchive::new(reader).unwrap();
-                let folder_to_store_natives =
-                    &current_file_to_download.path.replace("/natives.jar", "");
-                for i in 0..archive.len() {
-                    let mut file = archive.by_index(i).unwrap();
-                    let outpath = format!(
-                        "{}/{}",
-                        &folder_to_store_natives,
-                        file.mangled_name().to_string_lossy()
-                    );
-                    if file.is_dir() {
-                        println!("Creating directory: {:?}", outpath);
-                        std::fs::create_dir_all(&outpath).unwrap();
-                    } else {
-                        println!("Extracting file: {:?}", outpath);
-                        let mut outfile = File::create(&outpath).unwrap();
-                        std::io::copy(&mut file, &mut outfile).unwrap();
-                    }
-                }
-                fs::remove_file(&current_file_to_download.path).unwrap();
-            };
             println!("starting next download.");
             (
-                (id, Progress::Downloaded(list.len() as i32)),
-                State::Downloading(DownloadList {
-                    download_list: list,
-                    client: download_list.client,
-                }),
+                (
+                    id,
+                    Progress::Downloaded(download_list.download_list.len() as i32),
+                ),
+                State::Downloading(download_list),
             )
         }
         State::PreparingNeoForge {
@@ -589,7 +684,7 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
                     },
                 );
             }
-            let download = reqwest::get(neoforge_installer_url(&neoforge_version)).await;
+            let download = HTTP.get(neoforge_installer_url(&neoforge_version)).send().await;
             match download {
                 Ok(d) => {
                     let total = d.content_length().unwrap_or(0);
@@ -600,9 +695,7 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
                     (
                         (
                             id,
-                            Progress::NeoForgeStatus(String::from(
-                                "Downloading NeoForge installer...",
-                            )),
+                            Progress::NeoForgeStatus(t!("dl.neoforge_downloading").to_string()),
                         ),
                         State::DownloadingNeoForgeInstaller {
                             downloaded: 0,
@@ -633,16 +726,18 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
                     return ((id, Progress::Errored(e.to_string())), State::Idle);
                 }
                 let text = if total > 0 {
-                    format!(
-                        "Downloading NeoForge installer... {} / {} MiB",
-                        downloaded / 1048576,
-                        total / 1048576
+                    t!(
+                        "dl.neoforge_progress",
+                        done = downloaded / 1048576,
+                        total = total / 1048576
                     )
+                    .to_string()
                 } else {
-                    format!(
-                        "Downloading NeoForge installer... {} MiB",
-                        downloaded / 1048576
+                    t!(
+                        "dl.neoforge_progress_unknown",
+                        done = downloaded / 1048576
                     )
+                    .to_string()
                 };
                 (
                     (id, Progress::NeoForgeStatus(text)),
@@ -660,7 +755,7 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
             Ok(None) => (
                 (
                     id,
-                    Progress::NeoForgeStatus(String::from("Running NeoForge installer...")),
+                    Progress::NeoForgeStatus(t!("dl.neoforge_running").to_string()),
                 ),
                 State::RunningNeoForgeInstaller {
                     mc_version,
@@ -744,24 +839,22 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
         State::PreparingJavaDownload(java) => {
             let os = std::env::consts::OS;
             let java_url = temurin_jre_url(java.0);
-            let mc_dir = match std::env::consts::OS {
-                "linux" => format!("{}/.minecraft", std::env::var("HOME").unwrap()),
-                "windows" => format!(
-                    "{}/AppData/Roaming/.minecraft",
-                    std::env::var("USERPROFILE").unwrap().replace('\\', "/")
-                ),
-                _ => panic!("System not supported."),
-            };
+            let mc_dir = super::launcher::get_minecraft_dir();
             let folder_to_store_download = format!("{}/dgrlauncher_java", mc_dir);
             match fs::create_dir_all(&folder_to_store_download) {
                 Ok(ok) => ok,
                 Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
             }
-            let download = reqwest::get(java_url).await;
+            let download = HTTP.get(java_url).send().await;
             let file_name = match os {
                 "linux" => "compressed.tar.gz",
                 "windows" => "compressed.zip",
-                _ => panic!("System not supported."),
+                _ => {
+                    return (
+                        (id, Progress::Errored("System not supported.".to_owned())),
+                        State::Idle,
+                    )
+                }
             };
             let file_to_write =
                 match File::create(format!("{}/{}", folder_to_store_download, file_name)) {
@@ -828,7 +921,7 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
             let file_name = match os {
                 "linux" => "compressed.tar.gz",
                 "windows" => "compressed.zip",
-                _ => panic!("System not supported."),
+                _ => return ((id, Progress::Errored("System not supported.".to_owned())), State::Idle),
             };
             let compressed_java = match File::open(format!("{}/{}", folder, file_name)) {
                 Ok(ok) => ok,
@@ -836,116 +929,113 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
             };
             let java_folder_name = format!("java{}", java.0);
             let mut f_folder_name = String::new();
-            match os {
-                "windows" => {
-                    let mut archive = ZipArchive::new(BufReader::new(compressed_java)).unwrap();
-                    let mut got_first = false;
-                    for i in 0..archive.len() {
-                        let mut file = archive.by_index(i).unwrap();
-                        if !got_first {
-                            f_folder_name = file.name().to_string();
-                            got_first = true;
+            // Extraction is fallible end to end: any failure aborts with
+            // an error instead of panicking mid-unpack.
+            let extracted = (|| -> Result<(), String> {
+                match os {
+                    "windows" => {
+                        let mut archive = ZipArchive::new(BufReader::new(compressed_java))
+                            .map_err(|e| format!("Java archive broken: {e}"))?;
+                        let mut got_first = false;
+                        for i in 0..archive.len() {
+                            let mut file = archive
+                                .by_index(i)
+                                .map_err(|e| format!("Java entry broken: {e}"))?;
+                            if !got_first {
+                                f_folder_name = file.name().to_string();
+                                got_first = true;
+                            }
+                            let outpath = format!(
+                                "{}/{}",
+                                &folder,
+                                file.mangled_name().to_string_lossy()
+                            );
+                            if file.is_dir() {
+                                std::fs::create_dir_all(&outpath)
+                                    .map_err(|e| format!("Java folder failed: {e}"))?;
+                            } else {
+                                let mut outfile = File::create(&outpath)
+                                    .map_err(|e| format!("Java file failed: {e}"))?;
+                                std::io::copy(&mut file, &mut outfile)
+                                    .map_err(|e| format!("Java extract failed: {e}"))?;
+                            }
                         }
-                        let outpath =
-                            format!("{}/{}", &folder, file.mangled_name().to_string_lossy());
-                        if file.is_dir() {
-                            std::fs::create_dir_all(&outpath).unwrap();
-                        } else {
-                            let mut outfile = File::create(&outpath).unwrap();
-                            std::io::copy(&mut file, &mut outfile).unwrap();
-                        }
+                        Ok(())
                     }
-                }
-                "linux" => {
-                    let gz_decoder = flate2::read::GzDecoder::new(BufReader::new(compressed_java));
-                    let mut archive = tar::Archive::new(gz_decoder);
-                    let archive_iterator = archive.entries().unwrap();
-                    let mut got_first = false;
-                    for i in archive_iterator {
-                        let mut i = i.unwrap();
-                        if !got_first {
-                            f_folder_name = i
-                                .header()
-                                .path()
-                                .unwrap()
-                                .file_name()
-                                .unwrap()
-                                .to_string_lossy()
-                                .into_owned();
-                            got_first = true;
+                    "linux" => {
+                        let gz_decoder =
+                            flate2::read::GzDecoder::new(BufReader::new(compressed_java));
+                        let mut archive = tar::Archive::new(gz_decoder);
+                        let archive_iterator = archive
+                            .entries()
+                            .map_err(|e| format!("Java archive broken: {e}"))?;
+                        let mut got_first = false;
+                        for i in archive_iterator {
+                            let mut i =
+                                i.map_err(|e| format!("Java entry broken: {e}"))?;
+                            if !got_first {
+                                f_folder_name = i
+                                    .header()
+                                    .path()
+                                    .map_err(|e| format!("Java entry broken: {e}"))?
+                                    .file_name()
+                                    .ok_or_else(|| "Java archive has no top folder.".to_string())?
+                                    .to_string_lossy()
+                                    .into_owned();
+                                got_first = true;
+                            }
+                            i.unpack_in(&folder)
+                                .map_err(|e| format!("Java extract failed: {e}"))?;
                         }
-                        i.unpack_in(&folder).unwrap();
+                        Ok(())
                     }
+                    _ => Err("System not supported.".to_owned()),
                 }
-                _ => panic!("System not supported."),
+            })();
+            if let Err(e) = extracted {
+                return ((id, Progress::Errored(e)), State::Idle);
             }
-            fs::rename(
+            if f_folder_name.is_empty() {
+                return (
+                    (id, Progress::Errored("Java archive is empty.".to_owned())),
+                    State::Idle,
+                );
+            }
+            if let Err(e) = fs::rename(
                 format!("{}/{}", folder, f_folder_name),
                 format!("{}/{}", folder, java_folder_name),
-            )
-            .unwrap();
-            fs::remove_file(format!("{}/{}", folder, file_name)).unwrap();
+            ) {
+                return ((id, Progress::Errored(e.to_string())), State::Idle);
+            }
+            if let Err(e) = fs::remove_file(format!("{}/{}", folder, file_name)) {
+                return ((id, Progress::Errored(e.to_string())), State::Idle);
+            }
             ((id, Progress::JavaExtracted), State::Idle)
         }
-        State::DownloadingMissingFiles(download_list) => {
-            if download_list.download_list.is_empty() {
+        State::DownloadingMissingFiles(mut download_list) => {
+            let Some(current) = download_list.download_list.pop_front() else {
                 println!("finished");
                 return ((id, Progress::MissingFilesDownloadFinished), State::Idle);
-            }
-            let mut list = download_list.download_list.clone();
-            let current_file_to_download = list.remove(0);
-            println!("Downloading {}", current_file_to_download.path);
-            let current_download = match download_list
-                .client
-                .get(current_file_to_download.url)
-                .send()
-                .await
+            };
+            println!("Downloading {}", current.path);
+            if let Err(e) =
+                stream_to_file(&download_list.client, &current.url, &current.path).await
             {
-                Ok(ok) => ok.bytes().await.unwrap(),
-                Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
-            };
-            let mut file = match File::create(&current_file_to_download.path) {
-                Ok(file) => file,
-                Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
-            };
-            match file.write_all(&current_download) {
-                Ok(ok) => ok,
-                Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
+                return ((id, Progress::Errored(e)), State::Idle);
             }
-            if current_file_to_download.path.contains("natives.jar") {
-                let nativesfile = File::open(&current_file_to_download.path).unwrap();
-                let reader = BufReader::new(nativesfile);
-                let mut archive = ZipArchive::new(reader).unwrap();
-                let folder_to_store_natives =
-                    &current_file_to_download.path.replace("/natives.jar", "");
-                for i in 0..archive.len() {
-                    let mut file = archive.by_index(i).unwrap();
-                    let outpath = format!(
-                        "{}/{}",
-                        &folder_to_store_natives,
-                        file.mangled_name().to_string_lossy()
-                    );
-                    if file.is_dir() {
-                        println!("Creating directory: {:?}", outpath);
-                        std::fs::create_dir_all(&outpath).unwrap();
-                    } else {
-                        println!("Extracting file: {:?}", outpath);
-                        let mut outfile = File::create(&outpath).unwrap();
-                        std::io::copy(&mut file, &mut outfile).unwrap();
-                    }
-                }
-                fs::remove_file(&current_file_to_download.path).unwrap();
-            };
+            if current.path.contains("natives.jar") && let Err(e) = extract_natives(&current.path)
+            {
+                return ((id, Progress::Errored(e)), State::Idle);
+            }
             println!("starting next download.");
             (
                 (
                     id,
-                    Progress::MissingFilesDownloadProgressed(list.len() as u16),
+                    Progress::MissingFilesDownloadProgressed(
+                        download_list.download_list.len() as u16,
+                    ),
                 ),
-                State::DownloadingMissingFiles(DownloadList {
-                    download_list: list,
-                    client: download_list.client,
-                }),
+                State::DownloadingMissingFiles(download_list),
             )
         }
         State::PreparingUpdate(url) => {
@@ -963,7 +1053,7 @@ async fn download<I: 'static + Hash + Copy + Send + Sync>(
                 Ok(f) => f,
                 Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
             };
-            let download = reqwest::get(&url).await;
+            let download = HTTP.get(&url).send().await;
             match download {
                 Ok(d) => {
                     let size = d.content_length().unwrap_or(0);
@@ -1120,101 +1210,77 @@ pub async fn downloadversionjson(
     version: &String,
     foldertosave: &String,
     client: &Client,
-) -> Result<Value, reqwest::Error> {
-    match version_type {
-        VersionType::Vanilla => {
-            let versionlistjson = reqwest::Client::new()
-                .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
-                .send()
-                .await?
-                .text()
-                .await?;
-            let content = serde_json::from_str(&versionlistjson);
-            let p: Value = content.unwrap();
-            let mut url = "";
-            if let Some(versions) = p["versions"].as_array() {
-                for i in versions {
-                    if i["id"].as_str().unwrap() == version {
-                        url = i["url"].as_str().unwrap();
-                        break;
-                    }
-                }
+) -> Result<Value, String> {
+    async fn manifest_url(client: &Client, version: &str) -> Result<String, String> {
+        let text = client
+            .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
+            .send()
+            .await
+            .map_err(|e| format!("Version list download failed: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("Version list read failed: {e}"))?;
+        let p: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("Version list parse failed: {e}"))?;
+        let versions = p["versions"]
+            .as_array()
+            .ok_or_else(|| "Version list has no versions.".to_string())?;
+        for i in versions {
+            if i["id"].as_str().unwrap_or("") == version
+                && let Some(url) = i["url"].as_str()
+            {
+                return Ok(url.to_owned());
             }
-            println!("Downloading json...");
-            let versionjson = reqwest::Client::new()
-                .get(url)
-                .send()
-                .await?
-                .bytes()
-                .await?;
-            let jfilelocation = format!("{}/{}.json", foldertosave, version);
-            fs::create_dir_all(foldertosave).unwrap();
-            let mut jfile = File::create(&jfilelocation).unwrap();
-            jfile.write_all(&versionjson).unwrap();
-            drop(jfile);
-            let mut jfile = File::open(jfilelocation).unwrap();
-            let mut fcontent = String::new();
-            jfile.read_to_string(&mut fcontent).unwrap();
-            let content = serde_json::from_str(&fcontent);
-            let json: Value = content.unwrap();
-            Ok(json)
         }
+        Err(format!("Unknown Minecraft version: {version}"))
+    }
+    async fn fetch_bytes(client: &Client, url: &str, what: &str) -> Result<Vec<u8>, String> {
+        client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("{what} download failed: {e}"))?
+            .bytes()
+            .await
+            .map_err(|e| format!("{what} read failed: {e}"))
+            .map(|b| b.to_vec())
+    }
+    fn save_and_parse(folder: &str, name: &str, bytes: &[u8]) -> Result<Value, String> {
+        fs::create_dir_all(folder).map_err(|e| format!("Version folder failed: {e}"))?;
+        let location = format!("{folder}/{name}.json");
+        // Atomic: the launcher reads this file right after.
+        let tmp = format!("{location}.tmp");
+        fs::write(&tmp, bytes).map_err(|e| format!("Version file write failed: {e}"))?;
+        fs::rename(&tmp, &location).map_err(|e| format!("Version file write failed: {e}"))?;
+        let content =
+            fs::read_to_string(&location).map_err(|e| format!("Version file unreadable: {e}"))?;
+        serde_json::from_str(&content).map_err(|e| format!("Version file corrupt: {e}"))
+    }
+    println!("Downloading json...");
+    let url = manifest_url(client, version).await?;
+    let versionjson = fetch_bytes(client, &url, "Version json").await?;
+    // Small version jsons: one-shot fetch is fine (bulk files stream).
+    let vanilla: Value = save_and_parse(foldertosave, version, &versionjson)?;
+    match version_type {
+        VersionType::Vanilla => Ok(vanilla),
         VersionType::Fabric { loader } => {
-            let versionlistjson = reqwest::Client::new()
-                .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
-                .send()
-                .await?
-                .text()
-                .await?;
-            let content = serde_json::from_str(&versionlistjson);
-            let p: Value = content.unwrap();
-            let mut url = "";
-            if let Some(versions) = p["versions"].as_array() {
-                for i in versions {
-                    if i["id"].as_str().unwrap() == version {
-                        url = i["url"].as_str().unwrap();
-                        break;
-                    }
-                }
-            }
-            println!("Downloading json...");
-            let versionjson = reqwest::Client::new()
-                .get(url)
-                .send()
-                .await?
-                .bytes()
-                .await?;
-            let jfilelocation = format!("{}/{}.json", foldertosave, version);
-            fs::create_dir_all(foldertosave).unwrap();
-            let mut jfile = File::create(jfilelocation).unwrap();
-            jfile.write_all(&versionjson).unwrap();
-            let fabricloaderversion = loader.clone();
-            let verjson = client
-                .get(format!(
+            let verjson = fetch_bytes(
+                client,
+                &format!(
                     "https://meta.fabricmc.net/v2/versions/loader/{}/{}/profile/json",
-                    version, fabricloaderversion
-                ))
-                .send()
-                .await?
-                .bytes()
-                .await?;
-            let jfilelocation = format!("{}/{}-fabric.json", foldertosave, version);
-            fs::create_dir_all(foldertosave).unwrap();
-            let mut jfile = File::create(&jfilelocation).unwrap();
-            jfile.write_all(&verjson).unwrap();
-            let mut jfile = File::open(jfilelocation).unwrap();
-            let mut fcontent = String::new();
-            jfile.read_to_string(&mut fcontent).unwrap();
-            let content = serde_json::from_str(&fcontent);
-            let p: Value = content.unwrap();
-            Ok(p)
+                    version, loader
+                ),
+                "Fabric profile",
+            )
+            .await?;
+            save_and_parse(foldertosave, &format!("{version}-fabric"), &verjson)
         }
     }
 }
 pub async fn get_downloadable_version_list(
     showallversions: bool,
 ) -> Result<Vec<Vec<String>>, String> {
-    let client = reqwest::Client::new();
+    let client = HTTP.clone();
     let vanillaversionlistjson = match client
         .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
         .send()
@@ -1235,12 +1301,16 @@ pub async fn get_downloadable_version_list(
     if let Some(versions) = p["versions"].as_array() {
         if showallversions {
             for i in versions {
-                vanillaversionlist.push(i["id"].as_str().unwrap().to_owned())
+                if let Some(id) = i["id"].as_str() {
+                    vanillaversionlist.push(id.to_owned())
+                }
             }
         } else {
             for i in versions {
                 if i["type"] == "release" {
-                    vanillaversionlist.push(i["id"].as_str().unwrap().to_owned())
+                    if let Some(id) = i["id"].as_str() {
+                        vanillaversionlist.push(id.to_owned())
+                    }
                 }
             }
         }
@@ -1265,12 +1335,16 @@ pub async fn get_downloadable_version_list(
     if let Some(versions) = p.as_array() {
         if showallversions {
             for i in versions {
-                fabricversionlist.push(i["version"].as_str().unwrap().to_owned())
+                if let Some(v) = i["version"].as_str() {
+                    fabricversionlist.push(v.to_owned())
+                }
             }
         } else {
             for i in versions {
                 if i["stable"] == true {
-                    fabricversionlist.push(i["version"].as_str().unwrap().to_owned())
+                    if let Some(v) = i["version"].as_str() {
+                        fabricversionlist.push(v.to_owned())
+                    }
                 }
             }
         }
@@ -1292,14 +1366,19 @@ pub fn get_libraries(
     let mut library_download_list = vec![];
     for library in libraries {
         if library["rules"][0]["os"]["name"] == os || library["rules"][0]["os"]["name"].is_null() {
-            let libraryname = library["name"].as_str().unwrap();
+            let Some(libraryname) = library["name"].as_str() else {
+                return Err("Library without a name.".into());
+            };
             let mut lpieces: Vec<&str> = libraryname.split(':').collect();
+            if lpieces.is_empty() {
+                return Err(format!("Bad library coordinates: {libraryname}").into());
+            }
             let firstpiece = lpieces.remove(0).replace('.', "/");
-            let libtype = if library["name"]
-                .as_str()
-                .unwrap()
-                .contains(&format!("natives-{}", os))
-            {
+            // `artifact:version` at minimum for every branch below.
+            if lpieces.len() < 2 {
+                return Err(format!("Bad library coordinates: {libraryname}").into());
+            }
+            let libtype = if libraryname.contains(&format!("natives-{}", os)) {
                 LibraryType::Natives
             } else if library["natives"][os].is_null() {
                 LibraryType::Normal
@@ -1308,7 +1387,12 @@ pub fn get_libraries(
             };
             match libtype {
                 LibraryType::Natives => {
-                    let last_piece = lpieces.pop().unwrap();
+                    let Some(last_piece) = lpieces.pop() else {
+                        return Err(format!("Bad library coordinates: {libraryname}").into());
+                    };
+                    if lpieces.len() < 2 {
+                        return Err(format!("Bad library coordinates: {libraryname}").into());
+                    }
                     let lib = format!(
                         "{}/{}/{}-{}-{}.jar",
                         &firstpiece,
@@ -1319,16 +1403,19 @@ pub fn get_libraries(
                     );
                     let libpath =
                         super::launcher::artifact_path(library, &lib_dir, &lib);
-                    match fs::create_dir_all(
-                        Path::new(&libpath).parent().unwrap(),
-                    ) {
-                        Ok(ok) => ok,
-                        Err(err) => panic!("{err}"),
-                    };
+                    let parent = Path::new(&libpath).parent().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Bad library path: {libpath}"),
+                        )
+                    })?;
+                    fs::create_dir_all(parent).map_err(|e| {
+                        std::io::Error::other(format!("Library folder failed: {e}"))
+                    })?;
                     let unmodifiedurl = if !library["downloads"]["artifact"]["url"].is_null() {
-                        library["downloads"]["artifact"]["url"].as_str().unwrap()
+                        library["downloads"]["artifact"]["url"].as_str().unwrap_or("")
                     } else if !library["url"].is_null() {
-                        library["url"].as_str().unwrap()
+                        library["url"].as_str().unwrap_or("")
                     } else {
                         ""
                     };
@@ -1345,16 +1432,19 @@ pub fn get_libraries(
                     );
                     let libpath =
                         super::launcher::artifact_path(library, &lib_dir, &lib);
-                    match fs::create_dir_all(
-                        Path::new(&libpath).parent().unwrap(),
-                    ) {
-                        Ok(ok) => ok,
-                        Err(err) => panic!("{err}"),
-                    };
+                    let parent = Path::new(&libpath).parent().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Bad library path: {libpath}"),
+                        )
+                    })?;
+                    fs::create_dir_all(parent).map_err(|e| {
+                        std::io::Error::other(format!("Library folder failed: {e}"))
+                    })?;
                     let unmodifiedurl = if !library["downloads"]["artifact"]["url"].is_null() {
-                        library["downloads"]["artifact"]["url"].as_str().unwrap()
+                        library["downloads"]["artifact"]["url"].as_str().unwrap_or("")
                     } else if !library["url"].is_null() {
-                        library["url"].as_str().unwrap()
+                        library["url"].as_str().unwrap_or("")
                     } else {
                         ""
                     };
@@ -1372,16 +1462,19 @@ pub fn get_libraries(
                     );
                     let libpath =
                         super::launcher::artifact_path(library, &lib_dir, &lib);
-                    match fs::create_dir_all(
-                        Path::new(&libpath).parent().unwrap(),
-                    ) {
-                        Ok(ok) => ok,
-                        Err(err) => panic!("{err}"),
-                    };
+                    let parent = Path::new(&libpath).parent().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Bad library path: {libpath}"),
+                        )
+                    })?;
+                    fs::create_dir_all(parent).map_err(|e| {
+                        std::io::Error::other(format!("Library folder failed: {e}"))
+                    })?;
                     let unmodifiedurl = if !library["downloads"]["artifact"]["url"].is_null() {
-                        library["downloads"]["artifact"]["url"].as_str().unwrap()
+                        library["downloads"]["artifact"]["url"].as_str().unwrap_or("")
                     } else if !library["url"].is_null() {
-                        library["url"].as_str().unwrap()
+                        library["url"].as_str().unwrap_or("")
                     } else if !library["downloads"]["classifiers"][format!("natives-{}", os)]["url"]
                         .is_null()
                         || library["downloads"]["classifiers"][format!("natives-{}-64", os)]["url"]
@@ -1393,11 +1486,11 @@ pub fn get_libraries(
                         {
                             library["downloads"]["classifiers"][format!("natives-{}", os)]["url"]
                                 .as_str()
-                                .unwrap()
+                                .unwrap_or("")
                         } else {
                             library["downloads"]["classifiers"][format!("natives-{}-64", os)]["url"]
                                 .as_str()
-                                .unwrap()
+                                .unwrap_or("")
                         };
                         url
                     } else {
@@ -1411,9 +1504,9 @@ pub fn get_libraries(
         if !library["downloads"]["classifiers"][format!("natives-{}", os)].is_null() {
             let url = library["downloads"]["classifiers"][format!("natives-{}", os)]["url"]
                 .as_str()
-                .unwrap()
+                .unwrap_or("")
                 .to_string();
-            fs::create_dir_all(format!("{}/natives", foldertosave)).unwrap();
+            fs::create_dir_all(format!("{}/natives", foldertosave))?;
             let path = format!("{}/natives/natives.jar", foldertosave);
             library_download_list.push(Download { path, url });
         }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 use shared_child::SharedChild;
 use std::io::Read;
-use std::{collections::HashMap, env::set_current_dir};
+use std::collections::HashMap;
 use std::{
     env,
     fs::{self, OpenOptions},
@@ -47,11 +47,15 @@ fn main() -> iced::Result {
             Err(e) => println!("Failed to create Minecraft directory: {e}"),
         };
     }
-    let old_exec = env::current_exe().unwrap().with_extension("old");
-    if Path::new(&old_exec).exists() {
-        match fs::remove_file(old_exec) {
-            Ok(ok) => ok,
-            Err(e) => println!("Failed to delete old executable: {e}"),
+    // Best-effort cleanup of the pre-update backup (unknown exe path
+    // must not crash startup).
+    if let Ok(exe) = env::current_exe() {
+        let old_exec = exe.with_extension("old");
+        if Path::new(&old_exec).exists() {
+            match fs::remove_file(old_exec) {
+                Ok(ok) => ok,
+                Err(e) => println!("Failed to delete old executable: {e}"),
+            }
         }
     }
     let mut window_settings = window::Settings {
@@ -86,6 +90,13 @@ struct DgrLauncher {
     screen: Screen,
     launcher: Launcher,
     downloaders: Vec<Downloader>,
+    /// Monotonic downloader id source: `len()`-based ids collided after
+    /// mid-list removals (stale `Finished` matched someone else's entry).
+    next_downloader_id: usize,
+    /// Cached Main-screen mods count for the selection: `count_installed`
+    /// hits disk + JSON parse, so it runs on events, never per frame.
+    cached_mods_count: usize,
+    cached_mods_count_for: String,
     logs: Vec<String>,
     current_account: Account,
     current_account_mc_data: auth::MinecraftAccount,
@@ -258,7 +269,7 @@ fn write_instance_config(version: &str, cfg: &InstanceConfig) -> Result<(), Stri
     std::fs::create_dir_all(&dir).map_err(|e| format!("Instance folder failed: {e}"))?;
     let text =
         serde_json::to_string_pretty(cfg).map_err(|e| format!("Encode failed: {e}"))?;
-    std::fs::write(instance_config_path(version), text)
+    atomic_write(&instance_config_path(version), text.as_bytes())
         .map_err(|e| format!("Write failed: {e}"))
 }
 /// Base Minecraft version of an installed instance: `inheritsFrom` from
@@ -332,6 +343,30 @@ fn carry_icon_to_target(state: &mut DgrLauncher, target: String) {
 }
 /// Max accepted icon file size (2 MB).
 const MAX_ICON_BYTES: usize = 2_000_000;
+/// Max kept game-log lines: enough context to diagnose a crash even
+/// with spammy mods (~2-4 MB), still trivial for RAM and CopyLogs.
+const MAX_LOG_LINES: usize = 20_000;
+/// Single log lines longer than this are cut (a mod dumping base64/JSON
+/// in one line must not eat megabytes or stall the text widget).
+const MAX_LOG_LINE_LEN: usize = 2_000;
+/// Lines shown in the Logs screen: the tail is all a human reads, while
+/// CopyLogs still copies everything kept. Keeps `join` + layout cheap.
+pub(crate) const LOG_VIEW_TAIL: usize = 2_000;
+/// Max cached Modrinth icons (handles hold decoded image bytes).
+const MAX_STORE_ICONS: usize = 200;
+/// Push one game-log line: truncate giants, drop the oldest past the cap.
+fn push_log(state: &mut DgrLauncher, mut log: String) {
+    if log.len() > MAX_LOG_LINE_LEN {
+        // Cut by chars (not bytes) to keep UTF-8 intact.
+        let cut: String = log.chars().take(MAX_LOG_LINE_LEN).collect();
+        log = format!("{cut}…[truncated]");
+    }
+    state.logs.push(log);
+    let over = state.logs.len().saturating_sub(MAX_LOG_LINES);
+    if over > 0 {
+        state.logs.drain(..over);
+    }
+}
 /// Extension + magic bytes + size check for a picked icon file.
 fn validate_icon_bytes(bytes: &[u8], ext: &str) -> Result<(), String> {
     if bytes.len() > MAX_ICON_BYTES {
@@ -468,10 +503,10 @@ enum Message {
     CheckedUpdates(Result<(String, String, String), String>),
     RecheckUpdates,
     Update,
-    GotAuthCode(auth::AuthCode),
+    GotAuthCode(Result<auth::AuthCode, String>),
     ManageAuth((usize, auth::WaitProgress)),
-    GotXboxToken(auth::XboxLiveData),
-    GotMinecraftAuthData(auth::MinecraftAccount),
+    GotXboxToken(Result<auth::XboxLiveData, String>),
+    GotMinecraftAuthData(Result<auth::MinecraftAccount, String>),
     RefreshLogin(Option<auth::MinecraftAccount>),
     LocalAccountNameChanged(String),
     AddedLocalAccount,
@@ -631,11 +666,16 @@ impl DgrLauncher {
 fn boot() -> (DgrLauncher, Task<Message>) {
         backward_compatibility_measures();
         checksettingsfile();
-        let mut file = File::open(get_config_file_path()).unwrap();
-        let mut fcontent = String::new();
-        file.read_to_string(&mut fcontent).unwrap();
-        let content = serde_json::from_str(&fcontent);
-        let p: Value = content.unwrap();
+        // Tolerant config read: checksettingsfile just ensured defaults,
+        // but a torn file must degrade to defaults, not crash startup.
+        let p: Value = File::open(get_config_file_path())
+            .ok()
+            .and_then(|mut file| {
+                let mut fcontent = String::new();
+                file.read_to_string(&mut fcontent).ok()?;
+                serde_json::from_str(&fcontent).ok()
+            })
+            .unwrap_or(Value::Null);
         // Language: stored preference wins; missing/corrupt values fall
         // back to English (first launch was auto-detected in
         // `checksettingsfile`, which runs right above).
@@ -653,9 +693,9 @@ fn boot() -> (DgrLauncher, Task<Message>) {
             path: String::new(),
             flags: String::new(),
         };
-        currentjava.name = sanitize_java_name(p["current_java_name"].as_str().unwrap());
+        currentjava.name = sanitize_java_name(p["current_java_name"].as_str().unwrap_or(""));
         // Migrate old configs ("Java 8 (DgrLauncher)", removed custom names...).
-        if currentjava.name != p["current_java_name"].as_str().unwrap() {
+        if currentjava.name != p["current_java_name"].as_str().unwrap_or("") {
             persist_current_java_name(&currentjava.name);
         }
         if currentjava.name == "Custom" {
@@ -690,25 +730,30 @@ fn boot() -> (DgrLauncher, Task<Message>) {
         let mut accounts = vec![];
         if let Some(accounts_vec) = p["accounts"].as_array() {
             for account in accounts_vec {
-                let microsoft = account["microsoft"].as_bool().unwrap();
-                let username = account["username"].as_str().unwrap().to_string();
-                let refresh_token = account["refresh_token"].as_str().unwrap().to_string();
+                let (Some(microsoft), Some(username), Some(refresh_token)) = (
+                    account["microsoft"].as_bool(),
+                    account["username"].as_str(),
+                    account["refresh_token"].as_str(),
+                ) else {
+                    // Skip malformed rows instead of crashing startup.
+                    continue;
+                };
                 accounts.push(Account {
                     microsoft,
-                    username,
-                    refresh_token,
+                    username: username.to_owned(),
+                    refresh_token: refresh_token.to_owned(),
                 })
             }
         }
         let mut current_account = Account {
-            microsoft: p["current_account"]["microsoft"].as_bool().unwrap(),
+            microsoft: p["current_account"]["microsoft"].as_bool().unwrap_or(false),
             username: p["current_account"]["username"]
                 .as_str()
-                .unwrap()
+                .unwrap_or("")
                 .to_owned(),
             refresh_token: p["current_account"]["refresh_token"]
                 .as_str()
-                .unwrap()
+                .unwrap_or("")
                 .to_owned(),
         };
         // Self-heal: current_account must exist in accounts list.
@@ -719,29 +764,37 @@ fn boot() -> (DgrLauncher, Task<Message>) {
             current_account = accounts.first().cloned().unwrap_or_default();
             persist_current_account(&current_account);
         }
-        let current_version = p["current_version"].as_str().unwrap().to_owned();
+        let current_version = p["current_version"].as_str().unwrap_or("").to_owned();
         let current_version_info = describe_version(&current_version);
+        // Main-screen mods count, computed once here; refreshed on events.
+        let cached_mods_count = if current_version.is_empty() {
+            0
+        } else {
+            modrinth::count_installed(&current_version)
+        };
         (
             DgrLauncher {
                 screen: Screen::Main,
                 language,
                 minimize_on_launch: p["minimize_on_launch"].as_bool().unwrap_or(false),
                 current_account: current_account,
-                current_version,
+                current_version: current_version.clone(),
                 current_version_info,
-                game_ram: p["game_ram"].as_f64().unwrap(),
+                cached_mods_count,
+                cached_mods_count_for: current_version,
+                game_ram: p["game_ram"].as_f64().unwrap_or(2.5),
                 settings_ram_text: format!(
                     "{:.2}",
-                    p["game_ram"].as_f64().unwrap()
+                    p["game_ram"].as_f64().unwrap_or(2.5)
                 ),
                 current_java_name: currentjava.name.clone(),
                 current_java: currentjava,
-                game_wrapper_commands: p["game_wrapper_commands"].as_str().unwrap().to_owned(),
+                game_wrapper_commands: p["game_wrapper_commands"].as_str().unwrap_or("").to_owned(),
                 game_enviroment_variables: p["game_enviroment_variables"]
                     .as_str()
-                    .unwrap()
+                    .unwrap_or("")
                     .to_owned(),
-                show_all_versions_in_download_list: p["show_all_versions"].as_bool().unwrap(),
+                show_all_versions_in_download_list: p["show_all_versions"].as_bool().unwrap_or(false),
                 java_name_list: jvmnames,
                 custom_java_path: p["custom_java_path"].as_str().unwrap_or("").to_owned(),
                 custom_java_flags: p["custom_java_flags"].as_str().unwrap_or("").to_owned(),
@@ -816,11 +869,28 @@ impl DgrLauncher {
             Message::ClearNotices,
         )
     }
+    /// Refresh the cached Main-screen mods count for the selection.
+    fn refresh_mods_count(state: &mut DgrLauncher) {
+        state.cached_mods_count_for = state.current_version.clone();
+        state.cached_mods_count = if state.current_version.is_empty() {
+            0
+        } else {
+            modrinth::count_installed(&state.current_version)
+        };
+    }
     /// Drop a finished/failed downloader from the active list.
     fn remove_downloader(state: &mut DgrLauncher, id: usize) {
         if let Some(index) = state.downloaders.iter().position(|d| d.id == id) {
             state.downloaders.remove(index);
         }
+    }
+    /// Push an idle downloader with a fresh monotonic id; returns its
+    /// index for the `start_*` call that follows.
+    fn add_downloader(state: &mut DgrLauncher) -> usize {
+        let id = state.next_downloader_id;
+        state.next_downloader_id = state.next_downloader_id.wrapping_add(1);
+        state.downloaders.push(Downloader::new(id));
+        state.downloaders.len() - 1
     }
     /// Refresh the update entry after an install. Only the version list of
     /// the SAME project may be used: a stale page list of another mod must
@@ -925,11 +995,7 @@ impl DgrLauncher {
                                     state.game_state_text =
                                         t!("launch.downloading_java", major = major)
                                             .to_string();
-                                    state.downloaders.push(Downloader {
-                                        state: DownloaderState::Idle,
-                                        id: state.downloaders.len(),
-                                    });
-                                    let index = state.downloaders.len() - 1;
+                                    let index = add_downloader(state);
                                     state.downloaders[index]
                                         .start_java(downloader::Java(major))
                                 }
@@ -937,11 +1003,7 @@ impl DgrLauncher {
                                     state.game_state_text =
                                         t!("launch.missing_files").to_string();
                                     state.launcher.state = LauncherState::Waiting;
-                                    state.downloaders.push(Downloader {
-                                        state: DownloaderState::Idle,
-                                        id: state.downloaders.len(),
-                                    });
-                                    let index = state.downloaders.len() - 1;
+                                    let index = add_downloader(state);
                                     state.downloaders[index].start_missing_files(vec)
                                 }
                                 launcher::Missing::VanillaJson(ver, folder) => {
@@ -981,7 +1043,7 @@ impl DgrLauncher {
                         state.game_state_text = String::new()
                     }
                     launcher::Progress::GotLog(log) => {
-                        state.logs.push(log);
+                        push_log(state, log);
                     }
                     launcher::Progress::Finished => {
                         state.game_state_text = String::new();
@@ -1028,6 +1090,7 @@ impl DgrLauncher {
                 state.current_version = new_version;
                 // Selecting another instance disarms delete confirmation.
                 state.delete_confirm = None;
+                refresh_mods_count(state);
                 Task::none()
             }
             Message::DeleteInstancePressed(id) => {
@@ -1269,6 +1332,16 @@ impl DgrLauncher {
             }
             Message::ModIconLoaded(url, bytes) => {
                 let handle = bytes.map(iced::widget::image::Handle::from_bytes);
+                // Bound image memory: handles hold decoded bytes, and the
+                // catalog is endless. Evict one arbitrary entry past the
+                // cap (a refetch simply reloads it if still visible).
+                if !state.modstore_icons.contains_key(&url)
+                    && state.modstore_icons.len() >= MAX_STORE_ICONS
+                {
+                    if let Some(first) = state.modstore_icons.keys().next().cloned() {
+                        state.modstore_icons.remove(&first);
+                    }
+                }
                 state.modstore_icons.insert(url, handle);
                 Task::none()
             }
@@ -1324,6 +1397,7 @@ impl DgrLauncher {
                             state.modstore_status =
                                 t!("store.linked", count = n).to_string();
                             armed = true;
+                            refresh_mods_count(state);
                         } else if state.modstore_status.as_str()
                             == t!("store.identifying").as_ref()
                         {
@@ -1449,6 +1523,7 @@ impl DgrLauncher {
                         state.modstore_status = err;
                     }
                 }
+                refresh_mods_count(state);
                 return notice;
             }
             Message::ModDeletePressed(project_id) => {
@@ -1468,6 +1543,7 @@ impl DgrLauncher {
                     }
                     state.modstore_installed =
                         modrinth::installed_mods(&state.current_version);
+                    refresh_mods_count(state);
                     state.notice_seq = state.notice_seq.wrapping_add(1);
                     return clear_notices_later(state.notice_seq);
                 }
@@ -1693,7 +1769,10 @@ impl DgrLauncher {
                 state.instance_ram_text = s.clone();
                 let normalized = s.replace(',', ".");
                 match normalized.trim().parse::<f64>() {
-                    Ok(v) if (0.5..=32.0).contains(&v) => {
+                    Ok(v)
+                        if (screens::RAM_MIN..=screens::RAM_MAX)
+                            .contains(&v) =>
+                    {
                         let mut cfg = read_instance_config(&state.current_version);
                         cfg.ram = Some(v);
                         if let Err(e) =
@@ -1836,8 +1915,7 @@ impl DgrLauncher {
                     )
                     .to_string();
                     carry_icon_to_target(state, format!("{base}-fabric"));
-                    state.downloaders.push(Downloader::new(state.downloaders.len()));
-                    let index = state.downloaders.len() - 1;
+                    let index = add_downloader(state);
                     state.downloaders[index].start(
                         base,
                         downloader::VersionType::Fabric { loader },
@@ -1863,8 +1941,7 @@ impl DgrLauncher {
                     carry_icon_to_target(state, format!("neoforge-{nf}"));
                     state.il_status =
                         t!("common.downloading_mc_first").to_string();
-                    state.downloaders.push(Downloader::new(state.downloaders.len()));
-                    let index = state.downloaders.len() - 1;
+                    let index = add_downloader(state);
                     state.downloaders[index]
                         .start(mc, downloader::VersionType::Vanilla);
                     return Task::none();
@@ -1875,15 +1952,16 @@ impl DgrLauncher {
 
             Message::ChangeScreen(new_screen) => {
                 if state.screen == Screen::Settings {
-                    updatesettingsfile(
+                    if let Err(e) = updatesettingsfile(
                         state.game_ram,
                         state.current_java_name.clone(),
                         state.game_wrapper_commands.clone(),
                         state.game_enviroment_variables.clone(),
                         state.show_all_versions_in_download_list,
                         state.minimize_on_launch,
-                    )
-                    .unwrap();
+                    ) {
+                        println!("Failed to save settings: {e}");
+                    }
                 }
                 state.screen = new_screen.clone();
                 match new_screen {
@@ -2118,7 +2196,10 @@ impl DgrLauncher {
                 state.settings_ram_text = s.clone();
                 let normalized = s.replace(',', ".");
                 match normalized.trim().parse::<f64>() {
-                    Ok(v) if (0.5..=32.0).contains(&v) => {
+                    Ok(v)
+                        if (screens::RAM_MIN..=screens::RAM_MAX)
+                            .contains(&v) =>
+                    {
                         state.game_ram = v;
                         state.settings_status = String::new();
                     }
@@ -2334,9 +2415,7 @@ impl DgrLauncher {
                         let version = state.install_mc_version.clone();
                         remember_custom(version.clone());
                         remember_icon(version.clone());
-                        state.downloaders
-                            .push(Downloader::new(state.downloaders.len()));
-                        let index = state.downloaders.len() - 1;
+                        let index = add_downloader(state);
                         state.downloaders[index]
                             .start(version, downloader::VersionType::Vanilla);
                     }
@@ -2352,9 +2431,7 @@ impl DgrLauncher {
                         let default_id = format!("{version}-fabric");
                         remember_custom(default_id.clone());
                         remember_icon(default_id);
-                        state.downloaders
-                            .push(Downloader::new(state.downloaders.len()));
-                        let index = state.downloaders.len() - 1;
+                        let index = add_downloader(state);
                         state.downloaders[index].start(
                             version,
                             downloader::VersionType::Fabric { loader },
@@ -2384,9 +2461,7 @@ impl DgrLauncher {
                         // Prefetch vanilla files so the game doesn't have to
                         // download them on first launch; when this flow
                         // finishes, the installer starts (see Finished).
-                        state.downloaders
-                            .push(Downloader::new(state.downloaders.len()));
-                        let index = state.downloaders.len() - 1;
+                        let index = add_downloader(state);
                         state.downloaders[index]
                             .start(mc, downloader::VersionType::Vanilla);
                     }
@@ -2513,9 +2588,7 @@ impl DgrLauncher {
                         // is downloading: continue with the installer.
                         if state.downloaders.is_empty() {
                             if let Some((mc, nf)) = state.pending_neoforge_install.clone() {
-                                state.downloaders
-                                    .push(Downloader::new(state.downloaders.len()));
-                                let index = state.downloaders.len() - 1;
+                                let index = add_downloader(state);
                                 state.downloaders[index].start_neoforge(mc, nf);
                             }
                         }
@@ -2563,9 +2636,7 @@ impl DgrLauncher {
                         // Java downloaded for a pending NeoForge install:
                         // continue with the installer instead of launching.
                         if let Some((mc, nf)) = state.pending_neoforge_install.take() {
-                            state.downloaders
-                                .push(Downloader::new(state.downloaders.len()));
-                            let index = state.downloaders.len() - 1;
+                            let index = add_downloader(state);
                             state.downloaders[index].start_neoforge(mc, nf);
                             return Task::none();
                         }
@@ -2578,11 +2649,7 @@ impl DgrLauncher {
                         )
                         .to_string();
                         state.restrict_launch = true;
-                        state.downloaders.push(Downloader {
-                            state: DownloaderState::Idle,
-                            id: state.downloaders.len(),
-                        });
-                        let index = state.downloaders.len() - 1;
+                        let index = add_downloader(state);
                         state.downloaders[index].start_java(downloader::Java(major));
                         // Remembered when JavaExtracted arrives; cleared on error.
                         if state.pending_neoforge_install.is_none() {
@@ -2782,10 +2849,19 @@ impl DgrLauncher {
             }
             Message::LoadVersionList(ver_list) => {
                 state.all_versions = ver_list.clone();
-                if ver_list.len() == 1{
-                    state.current_version = ver_list[0].clone()
+                // Keep the user selection: adopt the single version only
+                // when nothing is selected or the selection vanished.
+                if state.current_version.is_empty()
+                    || !ver_list.contains(&state.current_version)
+                {
+                    if ver_list.len() == 1 {
+                        state.current_version = ver_list[0].clone();
+                    } else if !ver_list.contains(&state.current_version) {
+                        state.current_version = String::new();
+                    }
                 }
                 state.current_version_info = describe_version(&state.current_version);
+                refresh_mods_count(state);
                 // Load custom icons for the listed versions.
                 let mut tasks = Vec::new();
                 for v in &ver_list {
@@ -2810,12 +2886,18 @@ impl DgrLauncher {
                 iced::exit()
             }
             Message::CloseGame => {
+                // Stop button may arrive late (game already exited) or
+                // twice: never crash, just ignore a missing process.
+                // A failed kill is reported, not panicked.
                 match &state.game_proccess {
-                    GameProcess::Running(process) => match process.kill() {
-                        Ok(ok) => ok,
-                        Err(e) => panic!("{}", e),
-                    },
-                    GameProcess::Null => todo!(),
+                    GameProcess::Running(process) => {
+                        if let Err(e) = process.kill() {
+                            println!("Failed to stop the game: {e}");
+                            state.game_state_text =
+                                t!("launch.stop_failed").to_string();
+                        }
+                    }
+                    GameProcess::Null => {}
                 }
                 Task::none()
             }
@@ -2852,17 +2934,20 @@ impl DgrLauncher {
                 );
             }
             Message::Update => {
-                state.downloaders.push(Downloader {
-                    state: DownloaderState::Idle,
-                    id: state.downloaders.len(),
-                });
-                let index = state.downloaders.len() - 1;
+                let index = add_downloader(state);
                 state.downloaders[index].start_update(state.update_url.clone());
                 Task::none()
             }
-            Message::GotAuthCode(code) => {
-                state.auth_status = t!("auth.waiting_login").to_string();
-                state.auth_code = code;
+            Message::GotAuthCode(result) => {
+                match result {
+                    Ok(code) => {
+                        state.auth_status = t!("auth.waiting_login").to_string();
+                        state.auth_code = code;
+                    }
+                    Err(e) => {
+                        state.auth_status = e;
+                    }
+                }
                 Task::none()
             }
             Message::ManageAuth((_id, progress)) => {
@@ -2883,15 +2968,30 @@ impl DgrLauncher {
                 }
                 Task::none()
             }
-            Message::GotXboxToken(xbox_data) => {
-                state.auth_xbox_data = xbox_data.clone();
-                state.auth_status = t!("auth.logging_mc").to_string();
-                Task::perform(
-                    async move { auth::login_to_minecraft(xbox_data).await },
-                    Message::GotMinecraftAuthData,
-                )
+            Message::GotXboxToken(result) => {
+                match result {
+                    Ok(xbox_data) => {
+                        state.auth_xbox_data = xbox_data.clone();
+                        state.auth_status = t!("auth.logging_mc").to_string();
+                        Task::perform(
+                            async move { auth::login_to_minecraft(xbox_data).await },
+                            Message::GotMinecraftAuthData,
+                        )
+                    }
+                    Err(e) => {
+                        state.auth_status = e;
+                        Task::none()
+                    }
+                }
             }
-            Message::GotMinecraftAuthData(mc_account) => {
+            Message::GotMinecraftAuthData(result) => {
+                let mc_account = match result {
+                    Ok(a) => a,
+                    Err(e) => {
+                        state.auth_status = e;
+                        return Task::none();
+                    }
+                };
                 let refresh_token = state.auth_token.refresh_token.clone();
                 let account = Account {
                     microsoft: true,
@@ -2958,19 +3058,30 @@ impl DgrLauncher {
                 Task::none()
             }
             Message::RemoveAccount(account_name) => {
-                let mut config_file = getjson(get_config_file_path());
+                // Unreadable config: keep the in-memory list untouched
+                // instead of persisting a half-empty file over it.
+                let mut config_file = match load_config() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        println!("Failed to remove account: {e}");
+                        return Task::none();
+                    }
+                };
                 let mut updated_account_list = vec![];
                 if let Some(arr) = config_file["accounts"].as_array() {
                     for account in arr {
-                        if account["username"].as_str().unwrap() != &account_name {
-                            let microsoft = account["microsoft"].as_bool().unwrap();
-                            let username = account["username"].as_str().unwrap().to_owned();
-                            let refresh_token =
-                                account["refresh_token"].as_str().unwrap().to_owned();
+                        let (Some(microsoft), Some(username), Some(refresh_token)) = (
+                            account["microsoft"].as_bool(),
+                            account["username"].as_str(),
+                            account["refresh_token"].as_str(),
+                        ) else {
+                            continue;
+                        };
+                        if username != account_name {
                             updated_account_list.push(Account {
                                 microsoft,
-                                username,
-                                refresh_token,
+                                username: username.to_owned(),
+                                refresh_token: refresh_token.to_owned(),
                             })
                         }
                     }
@@ -2985,13 +3096,10 @@ impl DgrLauncher {
                 }
                 config_file["accounts"] = serde_json::json!(updated_account_list);
                 config_file["current_account"] = serde_json::json!(state.current_account);
-                let serialized = serde_json::to_string_pretty(&config_file).unwrap();
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(get_config_file_path())
-                    .unwrap();
-                file.write_all(serialized.as_bytes()).unwrap();
+                if let Err(e) = store_config(&config_file) {
+                    println!("Failed to remove account: {e}");
+                    return Task::none();
+                }
                 state.accounts = updated_account_list;
                 Task::none()
             }
@@ -3093,7 +3201,18 @@ fn checksettingsfile() -> bool {
         true => getjson(get_config_file_path()),
         false => serde_json::json!({}),
     };
-    let mut file = File::create(get_config_file_path()).unwrap();
+    // A torn file reads as Null: start fresh instead of persisting "null".
+    if !conf_json.is_object() {
+        println!("Settings file corrupt, starting fresh.");
+        conf_json = serde_json::json!({});
+    }
+    let mut file = match File::create(get_config_file_path()) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("Failed to open settings file: {e}");
+            return file_exists;
+        }
+    };
     if let Value::Object(map) = &mut conf_json {
         if !map.contains_key("custom_java_path") {
             map.insert(
@@ -3173,7 +3292,9 @@ fn checksettingsfile() -> bool {
         }
     }
     let serializedjson = serde_json::to_string_pretty(&conf_json).unwrap();
-    file.write_all(serializedjson.as_bytes()).unwrap();
+    if let Err(e) = file.write_all(serializedjson.as_bytes()) {
+        println!("Failed to write settings file: {e}");
+    }
     !file_exists
 }
 fn updateusersettingsfile(current_account: Account, version: String) -> std::io::Result<()> {
@@ -3182,28 +3303,35 @@ fn updateusersettingsfile(current_account: Account, version: String) -> std::io:
     data["current_version"] = serde_json::Value::String(version);
     store_config(&data)
 }
+/// Atomic file write: tmp in the same dir + rename, so readers never
+/// see a half-written file (crash or power loss mid-write).
+pub(crate) fn atomic_write(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?
+        .write_all(bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
 /// Settings-file transaction core shared by all persist helpers:
-/// legacy cwd reset (kept: the game launch moves cwd into the instance
-/// dir), read, parse. Serde failures map to `InvalidData`, exactly like
-/// the old `?` conversions did — callers only ever check presence.
+/// read + parse. All paths used here are absolute, so no cwd juggling.
+/// Serde failures map to `InvalidData`, exactly like the old `?`
+/// conversions did — callers only ever check presence.
 fn load_config() -> std::io::Result<Value> {
-    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
     let mut contents = String::new();
     File::open(get_config_file_path())?.read_to_string(&mut contents)?;
     serde_json::from_str(&contents)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
-/// Write back a mutated settings json (same legacy cwd reset).
+/// Write back a mutated settings json (atomic: tmp + rename, so a
+/// crash mid-write never leaves a half-written settings file).
 fn store_config(data: &Value) -> std::io::Result<()> {
-    set_current_dir(env::current_exe().unwrap().parent().unwrap()).unwrap();
     let serialized = serde_json::to_string_pretty(data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(get_config_file_path())?
-        .write_all(serialized.as_bytes())?;
-    Ok(())
+    atomic_write(&get_config_file_path(), serialized.as_bytes())
 }
 fn persist_current_account(current_account: &Account) {
     let mut data = match load_config() {
@@ -3369,25 +3497,32 @@ fn persist_custom_java(path: &str, flags: &str) {
     ]);
 }
 fn save_account(account: Account) -> Vec<Account> {
-    let mut data = load_config().unwrap();
-    if let Value::Array(arr) = &mut data["accounts"] {
-        arr.push(serde_json::json!(account));
-        data["accounts"] = serde_json::json!(arr);
-    }
+    // Disk failures must not lose the in-memory list: start from the
+    // stored file when readable, otherwise from just this account.
+    let data = load_config().unwrap_or_else(|_| serde_json::json!({}));
     let mut updated_account_list = vec![];
     if let Some(arr) = data["accounts"].as_array() {
-        for account in arr {
-            let microsoft = account["microsoft"].as_bool().unwrap();
-            let username = account["username"].as_str().unwrap().to_owned();
-            let refresh_token = account["refresh_token"].as_str().unwrap().to_owned();
+        for a in arr {
+            let (Some(microsoft), Some(username), Some(refresh_token)) = (
+                a["microsoft"].as_bool(),
+                a["username"].as_str(),
+                a["refresh_token"].as_str(),
+            ) else {
+                continue;
+            };
             updated_account_list.push(Account {
                 microsoft,
-                username,
-                refresh_token,
+                username: username.to_owned(),
+                refresh_token: refresh_token.to_owned(),
             })
         }
     }
-    store_config(&data).unwrap();
+    updated_account_list.push(account);
+    let mut data = data;
+    data["accounts"] = serde_json::json!(&updated_account_list);
+    if let Err(e) = store_config(&data) {
+        println!("Failed to save account: {e}");
+    }
     updated_account_list
 }
 fn updatesettingsfile(
@@ -3399,7 +3534,11 @@ fn updatesettingsfile(
     minimize_on_launch: bool,
 ) -> std::io::Result<()> {
     let mut data = load_config()?;
-    data["game_ram"] = serde_json::Value::Number(Number::from_f64(ram).unwrap());
+    // game_ram comes from validated UI input, but never let NaN/inf
+    // crash serialization: fall back to the default instead.
+    data["game_ram"] = Number::from_f64(ram)
+        .map(serde_json::Value::Number)
+        .unwrap_or_else(|| serde_json::Value::from(2.5));
     data["current_java_name"] = serde_json::Value::String(currentjvm);
     data["game_wrapper_commands"] = serde_json::Value::String(wrapper_commands);
     data["show_all_versions"] = serde_json::Value::Bool(showallversions);
@@ -3538,11 +3677,16 @@ struct Java {
     flags: String,
 }
 fn getjson(jpathstring: String) -> Value {
-    let jsonpath = Path::new(&jpathstring);
-    let mut file = File::open(jsonpath).unwrap();
-    let mut fcontent = String::new();
-    file.read_to_string(&mut fcontent).unwrap();
-    serde_json::from_str(&fcontent).unwrap()
+    // Tolerant reader: missing/corrupt files mean Null, and every
+    // caller handles Null via `unwrap_or`/`as_array` fallbacks.
+    File::open(Path::new(&jpathstring))
+        .ok()
+        .and_then(|mut file| {
+            let mut fcontent = String::new();
+            file.read_to_string(&mut fcontent).ok()?;
+            serde_json::from_str(&fcontent).ok()
+        })
+        .unwrap_or(Value::Null)
 }
 fn get_config_file_path() -> String {
     #[cfg(debug_assertions)]
@@ -3657,12 +3801,11 @@ pub fn rename_instance(mc_dir: &str, old: &str, new: &str) -> Result<(), String>
     Ok(())
 }
 fn is_file_empty(file_path: &str) -> bool {
-    let mut file = File::open(file_path).unwrap();
+    let Ok(mut file) = File::open(file_path) else {
+        return false;
+    };
     let mut buffer = [0; 1];
-    match file.read(&mut buffer).unwrap() {
-        0 => true,
-        _ => false,
-    }
+    matches!(file.read(&mut buffer), Ok(0))
 }
 fn migrate_path(old: &str, new: &str, label: &str) {
     if !Path::new(new).exists() && Path::new(old).exists() {

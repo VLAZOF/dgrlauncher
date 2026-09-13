@@ -7,16 +7,19 @@ use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 
 const API: &str = "https://api.modrinth.com/v2";
 const UA: &str = concat!("dgrlauncher/", env!("CARGO_PKG_VERSION"));
 
-fn client() -> Result<Client, String> {
+/// Shared HTTP client: one connection pool for all Modrinth requests
+/// (Modrinth 403s without a User-Agent, hence the builder).
+static HTTP: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
         .user_agent(UA)
         .build()
-        .map_err(|e| format!("HTTP client failed: {e}"))
-}
+        .unwrap_or_else(|_| Client::new())
+});
 
 /// Short mod info for the store list.
 #[derive(Debug, Clone, Default)]
@@ -107,7 +110,7 @@ pub async fn search_mods(query: &str) -> Result<Vec<ModSummary>, String> {
         "{API}/search?query={}&limit=25&index={index}&facets=%5B%5B%22project_type%3Amod%22%5D%5D",
         encode(query),
     );
-    let text = client()?
+    let text = HTTP
         .get(url)
         .send()
         .await
@@ -115,8 +118,7 @@ pub async fn search_mods(query: &str) -> Result<Vec<ModSummary>, String> {
         .text()
         .await
         .map_err(|e| format!("Search read failed: {e}"))?;
-    let v: Value =
-        serde_json::from_str(&text).map_err(|e| format!("Search parse failed: {e}"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("Search parse failed: {e}"))?;
     let mut out = Vec::new();
     if let Some(hits) = v["hits"].as_array() {
         for h in hits {
@@ -143,7 +145,7 @@ pub async fn search_mods(query: &str) -> Result<Vec<ModSummary>, String> {
 
 /// Full project info by id or slug.
 pub async fn get_project(id: &str) -> Result<ModDetail, String> {
-    let text = client()?
+    let text = HTTP
         .get(format!("{API}/project/{id}"))
         .send()
         .await
@@ -151,8 +153,7 @@ pub async fn get_project(id: &str) -> Result<ModDetail, String> {
         .text()
         .await
         .map_err(|e| format!("Project read failed: {e}"))?;
-    let v: Value =
-        serde_json::from_str(&text).map_err(|e| format!("Project parse failed: {e}"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("Project parse failed: {e}"))?;
     if v["id"].as_str().is_none() {
         return Err(format!(
             "Mod not found: {}",
@@ -172,7 +173,7 @@ pub async fn get_project(id: &str) -> Result<ModDetail, String> {
 /// All published versions (newest first), unfiltered: the page marks
 /// loader compatibility itself, and install (slice 2) picks from here.
 pub async fn get_versions(project_id: &str) -> Result<Vec<ModVersion>, String> {
-    let text = client()?
+    let text = HTTP
         .get(format!("{API}/project/{project_id}/version?limit=60"))
         .send()
         .await
@@ -257,12 +258,9 @@ pub async fn get_project_titles(ids: &[String]) -> HashMap<String, (String, Stri
         .collect::<Vec<_>>()
         .join(",");
     let url = format!("{API}/projects?ids={}", encode(&format!("[{joined}]")));
-    let text = match client() {
-        Ok(c) => match c.get(url).send().await {
-            Ok(r) => match r.text().await {
-                Ok(t) => t,
-                Err(_) => return out,
-            },
+    let text = match HTTP.get(url).send().await {
+        Ok(r) => match r.text().await {
+            Ok(t) => t,
             Err(_) => return out,
         },
         Err(_) => return out,
@@ -286,15 +284,7 @@ pub async fn get_project_titles(ids: &[String]) -> HashMap<String, (String, Stri
 /// Raw icon bytes. `None` on any error -> caller shows the cube fallback
 /// and remembers the URL as failed (no refetch loop).
 pub async fn fetch_icon(url: &str) -> Option<Vec<u8>> {
-    let bytes = client()
-        .ok()?
-        .get(url)
-        .send()
-        .await
-        .ok()?
-        .bytes()
-        .await
-        .ok()?;
+    let bytes = HTTP.get(url).send().await.ok()?.bytes().await.ok()?;
     if bytes.is_empty() {
         return None;
     }
@@ -384,10 +374,7 @@ pub fn installed_mods(version_id: &str) -> HashMap<String, InstalledMod> {
     let dir = mods_dir(version_id);
     if let Some(obj) = v.as_object() {
         for (pid, e) in obj {
-            let filename = match e["filename"]
-                .as_str()
-                .and_then(|n| safe_filename(n))
-            {
+            let filename = match e["filename"].as_str().and_then(|n| safe_filename(n)) {
                 Some(n) => n,
                 None => continue,
             };
@@ -430,7 +417,8 @@ fn write_sidecar(version_id: &str, map: &HashMap<String, InstalledMod>) -> Resul
         .map_err(|e| format!("Mods folder failed: {e}"))?;
     let text = serde_json::to_string_pretty(&Value::Object(obj))
         .map_err(|e| format!("Sidecar encode failed: {e}"))?;
-    std::fs::write(sidecar_path(version_id), text)
+    // Atomic: a torn sidecar would silently drop all installed mods.
+    crate::atomic_write(&sidecar_path(version_id), text.as_bytes())
         .map_err(|e| format!("Sidecar write failed: {e}"))
 }
 
@@ -443,7 +431,7 @@ pub async fn install_mod(
 ) -> Result<InstalledMod, String> {
     let filename = safe_filename(&version.filename)
         .ok_or_else(|| format!("Unsafe filename from Modrinth: {}", version.filename))?;
-    let bytes = client()?
+    let bytes = HTTP
         .get(&version.file_url)
         .send()
         .await
@@ -519,6 +507,16 @@ pub fn unlinked_mod_files(version_id: &str) -> Vec<String> {
     out
 }
 
+fn sha512_hex(data: &[u8]) -> String {
+    let mut hasher = sha2::Sha512::new();
+    use sha2::Digest;
+    hasher.update(data);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
 /// Hash unknown jars and ask Modrinth which projects they are
 /// (`POST /v2/version_files`), linking matches into the sidecar.
 /// Returns the linked count.
@@ -531,25 +529,20 @@ pub async fn link_unlinked_mods(version_id: &str) -> Result<usize, String> {
         known.insert(e.filename.clone());
     }
     let mut files: Vec<(String, String)> = Vec::new();
-    let entries =
-        std::fs::read_dir(&dir).map_err(|e| format!("mods read failed: {e}"))?;
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("mods read failed: {e}"))?;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.ends_with(".jar") || known.contains(&name) {
             continue;
         }
-        let data =
-            std::fs::read(entry.path()).map_err(|e| format!("read failed: {e}"))?;
-        let mut hasher = sha2::Sha512::new();
-        use sha2::Digest;
-        hasher.update(&data);
-        files.push((name, format!("{:x}", hasher.finalize())));
+        let data = std::fs::read(entry.path()).map_err(|e| format!("read failed: {e}"))?;
+        files.push((name, sha512_hex(&data)));
     }
     if files.is_empty() {
         return Ok(0);
     }
     let hashes: Vec<String> = files.iter().map(|(_, h)| h.clone()).collect();
-    let text = client()?
+    let text = HTTP
         .post(format!("{API}/version_files"))
         .json(&serde_json::json!({ "hashes": hashes, "algorithm": "sha512" }))
         .send()
@@ -599,4 +592,20 @@ pub async fn link_unlinked_mods(version_id: &str) -> Result<usize, String> {
         write_sidecar(&instance, &map)?;
     }
     Ok(linked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sha512_hex;
+    #[test]
+    fn sha512_matches_known_vectors() {
+        assert_eq!(
+            sha512_hex(b""),
+            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+        );
+        assert_eq!(
+            sha512_hex(b"abc"),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+    }
 }

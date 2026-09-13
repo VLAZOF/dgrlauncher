@@ -215,6 +215,7 @@
     "update_fail_replace": "Обновление не удалось (шаг замены): %{err}",
     "update_restart_fail": "Обновлено, но не удалось перезапуститься: %{err}",
     "checking_updates": "Проверяю обновления...",
+    "stop_failed": "Не удалось остановить игру.",
     "neoforge_needs_java": "Для установщика нужен Java %{major}. Сначала загружаю его..."
   },
   "auth": {
@@ -226,6 +227,9 @@
   },
   "dl": {
     "neoforge_running": "Запускаю установщик NeoForge...",
+    "neoforge_downloading": "Загружаю установщик NeoForge...",
+    "neoforge_progress": "Загружаю установщик NeoForge... %{done} / %{total} MiB",
+    "neoforge_progress_unknown": "Загружаю установщик NeoForge... %{done} MiB",
     "no_fabric": "Нет Fabric-загрузчика для %{mc}"
   },
   "upd": {

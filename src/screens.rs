@@ -56,6 +56,10 @@ fn instance_details(id: &str, java_name: &str) -> (String, String) {
 /// Shared memory row (global settings and per-instance settings):
 /// value label + slider + manual input. The instance screen appends its
 /// own "Global" reset button to the returned row.
+/// Single source of truth for the allowed range (matches the text-input
+/// validation `0.5..=32` and the `ram_range` locale strings).
+pub(crate) const RAM_MIN: f64 = 0.5;
+pub(crate) const RAM_MAX: f64 = 32.0;
 fn ram_controls<'a>(
     value: f64,
     input: &'a str,
@@ -64,7 +68,7 @@ fn ram_controls<'a>(
 ) -> Row<'a, Message, super::theme::Theme, Renderer> {
     row![
         text(format!("{value:.1} GiB")).size(14).width(Length::Fixed(80.)),
-        slider(0.5..=16.0, value, on_slider)
+        slider(RAM_MIN..=RAM_MAX, value, on_slider)
             .step(0.25)
             .width(Length::Fill),
         text_input("GiB", input)
@@ -437,9 +441,11 @@ pub fn get_screen_content<'a>(
                 ));
             }
             if has_selection {
+                // Event-refreshed cache (see refresh_mods_count): reading
+                // disk + JSON here would run on every frame.
                 info_column = info_column.push(text(t!(
                     "main.mods_count",
-                    count = crate::modrinth::count_installed(&app.current_version)
+                    count = app.cached_mods_count
                 )));
             }
             if !app.game_state_text_2.is_empty() {
@@ -907,11 +913,18 @@ pub fn get_screen_content<'a>(
             ]
             .spacing(15)
             .align_y(Alignment::Center),
-            container(
-                scrollable(text(app.logs.join("\n")).size(10))
+            container({
+                // Only the tail is rendered (see LOG_VIEW_TAIL): a 20k-line
+                // join on every frame would stall scrolling; CopyLogs
+                // still copies everything kept.
+                let skip = app
+                    .logs
+                    .len()
+                    .saturating_sub(super::LOG_VIEW_TAIL);
+                scrollable(text(app.logs[skip..].join("\n")).size(10))
                     .width(700.0)
                     .height(345.)
-            )
+            })
             .style(theme::black_container)
             .padding(5)
         ]

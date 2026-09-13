@@ -174,7 +174,15 @@ impl Hash for GameSettings {
 async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
     match state {
         State::Checking(game_settings) => {
-            let game_settings = game_settings.unwrap();
+            let Some(game_settings) = game_settings else {
+                return (
+                    (
+                        id,
+                        Progress::Errored("Launcher started without settings.".to_owned()),
+                    ),
+                    State::Idle,
+                );
+            };
             let minecraft_dir = get_minecraft_dir();
             let version_dir = format!("{}/versions/{}", minecraft_dir, game_settings.game_version);
             let jsonpathstring = format!(
@@ -195,9 +203,29 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                 }
             };
             let mut json_file_content = String::new();
-            json_file.read_to_string(&mut json_file_content).unwrap();
-            let content = serde_json::from_str(&json_file_content);
-            let mut p: Value = content.unwrap();
+            if let Err(e) = json_file.read_to_string(&mut json_file_content) {
+                return (
+                    (
+                        id,
+                        Progress::Errored(format!("Version file unreadable: {e}")),
+                    ),
+                    State::Idle,
+                );
+            }
+            let mut p: Value = match serde_json::from_str(&json_file_content) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        (
+                            id,
+                            Progress::Errored(format!(
+                                "Version file corrupt, try reinstalling: {e}"
+                            )),
+                        ),
+                        State::Idle,
+                    )
+                }
+            };
             if let Some(vanilla_ver) = p["inheritsFrom"].as_str() {
                 let json_path = format!(
                     "{}/versions/{}/{}.json",
@@ -210,17 +238,28 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                     ))
                     .exists()
                     {
-                        let mut needed_json = File::open(format!(
-                            "{}/versions/{}/{}.json",
-                            minecraft_dir, vanilla_ver, vanilla_ver
-                        ))
-                        .unwrap();
-                        let mut needed_json_content = Vec::new();
-                        needed_json.read_to_end(&mut needed_json_content).unwrap();
-                        File::create(&json_path)
-                            .unwrap()
-                            .write_all(&needed_json_content)
-                            .unwrap();
+                        let copy = (|| -> std::io::Result<()> {
+                            let mut needed_json = File::open(format!(
+                                "{}/versions/{}/{}.json",
+                                minecraft_dir, vanilla_ver, vanilla_ver
+                            ))?;
+                            let mut needed_json_content = Vec::new();
+                            needed_json.read_to_end(&mut needed_json_content)?;
+                            File::create(&json_path)?
+                                .write_all(&needed_json_content)?;
+                            Ok(())
+                        })();
+                        if let Err(e) = copy {
+                            return (
+                                (
+                                    id,
+                                    Progress::Errored(format!(
+                                        "Vanilla json copy failed: {e}"
+                                    )),
+                                ),
+                                State::Idle,
+                            );
+                        }
                     } else {
                         println!("Vanilla Json needs to be downloaded.");
                         return (
@@ -256,9 +295,23 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                     .as_str()
                     .is_some_and(|m| m.contains("bootstraplauncher"));
             if modded {
+                let loader_libs = match p["libraries"].as_array() {
+                    Some(a) => a,
+                    None => {
+                        return (
+                            (
+                                id,
+                                Progress::Errored(
+                                    "Loader profile has no libraries.".to_owned(),
+                                ),
+                            ),
+                            State::Idle,
+                        )
+                    }
+                };
                 match super::downloader::get_libraries(
                     &minecraft_dir,
-                    p["libraries"].as_array().unwrap(),
+                    loader_libs,
                     &version_dir,
                 ) {
                     Ok(ok) => {
@@ -273,21 +326,65 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                     }
                     Err(e) => println!("Failed to get libraries, ignoring. -> {e}"),
                 }
-                let mut vanilla_json_content = String::new();
-                let mut vanilla_json_file = match File::open(format!(
-                    "{}/versions/{}/{}.json",
-                    minecraft_dir,
-                    game_settings.game_version,
-                    p["inheritsFrom"].as_str().unwrap()
-                )) {
-                    Ok(ok) => ok,
-                    Err(_) => panic!("no!!!"),
+                let inherits = match p["inheritsFrom"].as_str() {
+                    Some(v) => v.to_owned(),
+                    None => {
+                        return (
+                            (
+                                id,
+                                Progress::Errored(
+                                    "Loader profile has no base version.".to_owned(),
+                                ),
+                            ),
+                            State::Idle,
+                        )
+                    }
                 };
-                vanilla_json_file
+                let vanilla_path = format!(
+                    "{}/versions/{}/{}.json",
+                    minecraft_dir, game_settings.game_version, inherits
+                );
+                let mut vanilla_json_file = match File::open(&vanilla_path) {
+                    Ok(ok) => ok,
+                    Err(e) => {
+                        return (
+                            (
+                                id,
+                                Progress::Errored(format!(
+                                    "Vanilla json missing, try reinstalling: {e}"
+                                )),
+                            ),
+                            State::Idle,
+                        )
+                    }
+                };
+                let mut vanilla_json_content = String::new();
+                if vanilla_json_file
                     .read_to_string(&mut vanilla_json_content)
-                    .unwrap();
-                let content = serde_json::from_str(&vanilla_json_content);
-                p = content.unwrap();
+                    .is_err()
+                {
+                    return (
+                        (
+                            id,
+                            Progress::Errored("Vanilla json unreadable.".to_owned()),
+                        ),
+                        State::Idle,
+                    );
+                }
+                p = match serde_json::from_str(&vanilla_json_content) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return (
+                            (
+                                id,
+                                Progress::Errored(format!(
+                                    "Vanilla json corrupt, try reinstalling: {e}"
+                                )),
+                            ),
+                            State::Idle,
+                        )
+                    }
+                };
             }
             // Modded BootstrapLauncher versions (NeoForge) run from
             // libraries; the per-version jar is required otherwise.
@@ -308,9 +405,23 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                     }
                 }
             }
+            let vanilla_libs = match p["libraries"].as_array() {
+                Some(a) => a,
+                None => {
+                    return (
+                        (
+                            id,
+                            Progress::Errored(
+                                "Version file has no libraries.".to_owned(),
+                            ),
+                        ),
+                        State::Idle,
+                    )
+                }
+            };
             match super::downloader::get_libraries(
                 &minecraft_dir,
-                p["libraries"].as_array().unwrap(),
+                vanilla_libs,
                 &version_dir,
             ) {
                 Ok(ok) => {
@@ -328,26 +439,40 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
             let asset_index_path = format!(
                 "{}/assets/indexes/{}.json",
                 minecraft_dir,
-                p["assets"].as_str().unwrap()
+                p["assets"].as_str().unwrap_or("unknown")
             );
-            if !Path::new(&asset_index_path).exists() {
-                match reqwest::get(p["assetIndex"]["url"].as_str().unwrap()).await {
+            if !Path::new(&asset_index_path).exists()
+                && let Some(asset_url) = p["assetIndex"]["url"].as_str()
+            {
+                match reqwest::get(asset_url).await {
                     Ok(ok) => {
-                        let bytes = ok.bytes().await.unwrap();
-                        match fs::create_dir_all(format!("{}/assets/indexes", minecraft_dir)) {
-                            Ok(ok) => ok,
+                        let bytes = match ok.bytes().await {
+                            Ok(b) => Some(b),
                             Err(e) => {
-                                println!("Failed to create asset index directory, ignoring. -> {e}")
+                                println!("Failed to read asset index, ignoring. -> {e}");
+                                None
                             }
-                        }
-                        match File::create(&asset_index_path) {
-                            Ok(mut ok) => match ok.write_all(&bytes) {
-                                Ok(ok) => ok,
-                                Err(e) => {
-                                    println!("Failed to write to asset index, ignoring. -> {e}")
+                        };
+                        // Never persist an empty body: a torn file would
+                        // pass the `exists` check below with zero assets.
+                        if let Some(bytes) = bytes {
+                            if !bytes.is_empty() {
+                                match fs::create_dir_all(format!("{}/assets/indexes", minecraft_dir)) {
+                                    Ok(ok) => ok,
+                                    Err(e) => {
+                                        println!("Failed to create asset index directory, ignoring. -> {e}")
+                                    }
                                 }
-                            },
-                            Err(e) => println!("Failed to create asset index, ignoring. -> {e}"),
+                                match File::create(&asset_index_path) {
+                                    Ok(mut ok) => match ok.write_all(&bytes) {
+                                        Ok(ok) => ok,
+                                        Err(e) => {
+                                            println!("Failed to write to asset index, ignoring. -> {e}")
+                                        }
+                                    },
+                                    Err(e) => println!("Failed to create asset index, ignoring. -> {e}"),
+                                }
+                            }
                         }
                     }
                     Err(e) => println!("Failed to download asset index, ignoring. -> {e}"),
@@ -356,7 +481,7 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
             if Path::new(&format!(
                 "{}/assets/indexes/{}.json",
                 minecraft_dir,
-                p["assets"].as_str().unwrap()
+                p["assets"].as_str().unwrap_or("unknown")
             ))
             .exists()
             {
@@ -407,8 +532,15 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
             // computed by the caller. Shared files (versions, libraries,
             // assets, java) stay in `.minecraft`.
             let game_dir = game_settings.game_directory.clone();
-            fs::create_dir_all(&game_dir).expect("Failed to create instance folder!");
-            env::set_current_dir(&game_dir).expect("Failed to open instance folder!");
+            if let Err(e) = fs::create_dir_all(&game_dir) {
+                return (
+                    (
+                        id,
+                        Progress::Errored(format!("Instance folder failed: {e}")),
+                    ),
+                    State::Idle,
+                );
+            }
             let assets_dir = format!("{}/assets", &minecraft_directory);
             let jsonpathstring = format!(
                 "{}/versions/{}/{}.json",
@@ -420,16 +552,50 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                 Err(e) => return ((id, Progress::Errored(e.to_string())), State::Idle),
             };
             let mut json_file_content = String::new();
-            json_file.read_to_string(&mut json_file_content).unwrap();
-            let content = serde_json::from_str(&json_file_content);
-            let p: Value = content.unwrap();
-            let main_class = &p["mainClass"].as_str().unwrap();
+            if json_file
+                .read_to_string(&mut json_file_content)
+                .is_err()
+            {
+                return (
+                    (id, Progress::Errored("Version file unreadable.".to_owned())),
+                    State::Idle,
+                );
+            }
+            let p: Value = match serde_json::from_str(&json_file_content) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        (
+                            id,
+                            Progress::Errored(format!("Version file corrupt: {e}")),
+                        ),
+                        State::Idle,
+                    )
+                }
+            };
+            let main_class = match p["mainClass"].as_str() {
+                Some(m) => m.to_owned(),
+                None => {
+                    return (
+                        (
+                            id,
+                            Progress::Errored(
+                                "Version file has no main class.".to_owned(),
+                            ),
+                        ),
+                        State::Idle,
+                    )
+                }
+            };
             let asset_index = p["assets"].as_str().unwrap_or("").to_string();
             let native_directory = format!(
                 "{}/versions/{}/natives",
                 &minecraft_directory, game_settings.game_version
             );
-            let mut library_list = lib_manager(&p);
+            let mut library_list = match lib_manager(&p) {
+                Ok(l) => l,
+                Err(e) => return ((id, Progress::Errored(e)), State::Idle),
+            };
             let mut version_jvm_args = get_game_jvm_args(&p, &native_directory);
             let mut version_game_args = vec![];
             let uuid = if game_settings.account.uuid.is_empty() {
@@ -456,7 +622,10 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                 || !p["inheritsFrom"].is_null()
             {
                 let (modded_jvm_args, modded_game_args, vanilla_version_library_list) =
-                    modded(&p, &game_settings.game_version, gamedata.clone());
+                    match modded(&p, &game_settings.game_version, gamedata.clone()) {
+                        Ok(t) => t,
+                        Err(e) => return ((id, Progress::Errored(e)), State::Idle),
+                    };
                 version_jvm_args.extend(modded_jvm_args);
                 library_list.push_str(&vanilla_version_library_list);
                 version_game_args = modded_game_args;
@@ -488,10 +657,10 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                 if let Some(arguments) = p["arguments"]["game"].as_array() {
                     let mut str_arguments = vec![];
                     for i in arguments {
-                        if i.is_string() {
-                            str_arguments.push(i.as_str().unwrap_or("").to_owned())
-                        } else if i["value"].is_string() {
-                            str_arguments.push(i["value"].as_str().unwrap().to_owned())
+                        if let Some(s) = i.as_str() {
+                            str_arguments.push(s.to_owned())
+                        } else if let Some(s) = i["value"].as_str() {
+                            str_arguments.push(s.to_owned())
                         }
                     }
                     version_game_args.extend_from_slice(&get_game_args(str_arguments, &gamedata));
@@ -524,11 +693,20 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                 .arg(library_list.clone())
                 .arg(main_class)
                 .args(version_game_args.clone());
+            // The game runs with the instance dir as its cwd (saves,
+            // configs and crash reports land there); the launcher
+            // process itself never changes directory.
+            game_command.current_dir(&game_dir);
             game_command.envs(game_settings.enviroment_variables);
             if cfg!(debug_assertions) {
                 println!("{:?}", game_command)
             }
-            if command_exists(game_command.get_program().to_str().unwrap()) {
+            // Non-UTF8 program paths can never resolve: report, don't panic.
+            if game_command
+                .get_program()
+                .to_str()
+                .is_some_and(command_exists)
+            {
                 let game_process_receiver = run_and_log_game(game_command);
                 if let Ok(game_pr_rec) = game_process_receiver.await {
                     (
@@ -561,7 +739,9 @@ async fn launcher<I: Copy>(id: I, state: State) -> ((I, Progress), State) {
                     State::GettingLogs(receiver),
                 )
             } else {
-                receiver.1.join().expect("Failed to join child thread");
+                // The log thread is gone (or panicked on IO): the game is
+                // over either way, never crash the launcher here.
+                let _ = receiver.1.join();
                 ((id, Progress::Finished), State::Idle)
             }
         }
@@ -573,8 +753,7 @@ async fn run_and_log_game(
 ) -> std::io::Result<((Receiver<String>, JoinHandle<()>), Arc<SharedChild>)> {
     let (sender, receiver) = mpsc::channel();
     let shared_child =
-        SharedChild::spawn(game_command.stdout(Stdio::piped()).stderr(Stdio::piped()))
-            .expect("failed to start game process.");
+        SharedChild::spawn(game_command.stdout(Stdio::piped()).stderr(Stdio::piped()))?;
     let child_arc = Arc::new(shared_child);
     let child_clone = child_arc.clone();
     let child_thread = thread::spawn(move || {
@@ -602,19 +781,25 @@ async fn run_and_log_game(
                 }
             }
         }
-        let status = child_clone
-            .wait()
-            .expect("Failed to wait for child process");
-        println!("Child process exited with: {}", status);
+        let status = child_clone.wait();
+        match status {
+            Ok(status) => println!("Child process exited with: {}", status),
+            Err(e) => eprintln!("Failed to wait for child process: {e}"),
+        }
     });
     Ok(((receiver, child_thread), child_arc))
 }
 pub fn get_minecraft_dir() -> String {
     match std::env::consts::OS {
-        "linux" => format!("{}/.minecraft", std::env::var("HOME").unwrap()),
+        "linux" => format!(
+            "{}/.minecraft",
+            std::env::var("HOME").unwrap_or_else(|_| ".".to_owned())
+        ),
         "windows" => format!(
             "{}/AppData/Roaming/.minecraft",
-            std::env::var("USERPROFILE").unwrap().replace('\\', "/")
+            std::env::var("USERPROFILE")
+                .unwrap_or_else(|_| ".".to_owned())
+                .replace('\\', "/")
         ),
         _ => panic!("System not supported."),
     }
@@ -622,14 +807,16 @@ pub fn get_minecraft_dir() -> String {
 pub async fn getinstalledversions() -> Vec<String> {
     let versions_dir = format!("{}/versions", get_minecraft_dir());
     if !Path::new(&versions_dir).exists() {
-        fs::create_dir_all(&versions_dir).unwrap();
+        let _ = fs::create_dir_all(&versions_dir);
     }
-    let entries = fs::read_dir(versions_dir).unwrap();
+    let Ok(entries) = fs::read_dir(&versions_dir) else {
+        return Vec::new();
+    };
     let mut versions = entries
         .filter_map(|entry| {
-            let path = entry.unwrap().path();
+            let path = entry.ok()?.path();
             if path.is_dir() {
-                Some(path.file_name().unwrap().to_string_lossy().to_string())
+                Some(path.file_name()?.to_string_lossy().to_string())
             } else {
                 None
             }
@@ -734,8 +921,8 @@ fn get_game_jvm_args(p: &Value, nativedir: &str) -> Vec<String> {
     let mut version_jvm_args = vec![];
     if let Some(arguments) = p["arguments"]["jvm"].as_array() {
         for i in arguments {
-            if i.is_string() {
-                let mut value = i.as_str().unwrap().to_string();
+            if let Some(s) = i.as_str() {
+                let mut value = s.to_string();
                 if value.contains("${natives_directory}") {
                     value = value.replace("${natives_directory}", nativedir);
                 }
@@ -746,7 +933,7 @@ fn get_game_jvm_args(p: &Value, nativedir: &str) -> Vec<String> {
                     value = value.replace("${classpath_separator}", separator);
                 }
                 if value.contains("${version_name}") {
-                    let game_ver = p["id"].as_str().unwrap();
+                    let game_ver = p["id"].as_str().unwrap_or("");
                     value = value.replace("${version_name}", game_ver)
                 }
                 if !value.contains("${classpath}") && !value.contains("-cp") {
@@ -835,7 +1022,10 @@ fn automatic_java(p: Value, game_version: &String, ismodded: bool) -> (String, V
         args.split(' ').map(|s| s.to_owned()).collect(),
     )
 }
-fn lib_manager(p: &Value) -> String {
+/// Classpath entries for one version json. Malformed entries fail the
+/// whole launch loudly (reinstall hint) instead of panicking: a silent
+/// skip would surface later as a confusing game-side ClassNotFound.
+fn lib_manager(p: &Value) -> Result<String, String> {
     let os = std::env::consts::OS;
     let mc_dir = get_minecraft_dir();
     let mut library_list = String::new();
@@ -855,10 +1045,19 @@ fn lib_manager(p: &Value) -> String {
             if library["rules"][0]["os"]["name"] == os
                 || library["rules"][0]["os"]["name"].is_null()
             {
-                let libraryname = library["name"].as_str().unwrap();
+                let Some(libraryname) = library["name"].as_str() else {
+                    return Err("Version file has a library without a name.".to_owned());
+                };
                 let mut lpieces: Vec<&str> = libraryname.split(':').collect();
+                if lpieces.is_empty() {
+                    return Err(format!("Version file has a bad library: {libraryname}"));
+                }
                 let firstpiece = lpieces[0].replace('.', "/");
                 lpieces.remove(0);
+                // `group:artifact:version[:classifier]` minus group.
+                if lpieces.len() < 2 {
+                    return Err(format!("Version file has a bad library: {libraryname}"));
+                }
                 let lib_type = if libraryname.contains(&format!("natives-{}", os)) {
                     LibraryType::Natives
                 } else if library["natives"][os].is_null() {
@@ -868,7 +1067,16 @@ fn lib_manager(p: &Value) -> String {
                 };
                 match lib_type {
                     LibraryType::Natives => {
-                        let last_piece = lpieces.pop().unwrap();
+                        let Some(last_piece) = lpieces.pop() else {
+                            return Err(format!(
+                                "Version file has a bad library: {libraryname}"
+                            ));
+                        };
+                        if lpieces.len() < 2 {
+                            return Err(format!(
+                                "Version file has a bad library: {libraryname}"
+                            ));
+                        }
                         let computed = format!(
                             "{}/{}/{}-{}-{}.jar",
                             &firstpiece,
@@ -913,36 +1121,45 @@ fn lib_manager(p: &Value) -> String {
             }
         }
     }
-    library_list
+    Ok(library_list)
 }
 fn modded(
     p: &Value,
     game_version: &String,
     mut gamedata: Vec<String>,
-) -> (Vec<String>, Vec<String>, String) {
+) -> Result<(Vec<String>, Vec<String>, String), String> {
     let mc_dir = get_minecraft_dir();
     // Loader's own game args first (e.g. NeoForge bootstrap flags
     // --launchTarget/--fml.*; fabric profiles carry none, so this is a no-op
     // there), vanilla placeholders appended after.
     let mut modded_game_args = loader_own_game_args(p);
-    let vanillaversion = p["inheritsFrom"].as_str().unwrap();
+    let vanillaversion = p["inheritsFrom"]
+        .as_str()
+        .ok_or_else(|| "Loader profile has no base version.".to_string())?;
     let vanillajsonpathstring = format!(
         "{}/versions/{}/{}.json",
         &mc_dir, game_version, vanillaversion
     );
-    let mut vanillajson = File::open(vanillajsonpathstring).unwrap();
+    let mut vanillajson =
+        File::open(vanillajsonpathstring).map_err(|e| format!("Vanilla json missing: {e}"))?;
     let mut vjsoncontent = String::new();
-    vanillajson.read_to_string(&mut vjsoncontent).unwrap();
-    let vjson: Value = serde_json::from_str(&vjsoncontent).unwrap();
-    let new_asset_index = vjson["assets"].as_str().unwrap().to_string();
+    vanillajson
+        .read_to_string(&mut vjsoncontent)
+        .map_err(|e| format!("Vanilla json unreadable: {e}"))?;
+    let vjson: Value =
+        serde_json::from_str(&vjsoncontent).map_err(|e| format!("Vanilla json corrupt: {e}"))?;
+    let new_asset_index = vjson["assets"]
+        .as_str()
+        .ok_or_else(|| "Vanilla json has no assets index.".to_string())?
+        .to_string();
     gamedata[4] = new_asset_index;
     if let Some(arguments) = vjson["arguments"]["game"].as_array() {
         let mut base_arguments = Vec::new();
         for i in arguments {
-            if i.is_string() {
-                base_arguments.push(i.as_str().unwrap().to_string())
-            } else if i["value"].is_string() {
-                base_arguments.push(i["value"].as_str().unwrap().to_string())
+            if let Some(s) = i.as_str() {
+                base_arguments.push(s.to_string())
+            } else if let Some(s) = i["value"].as_str() {
+                base_arguments.push(s.to_string())
             }
         }
         modded_game_args.extend(get_game_args(base_arguments, &gamedata))
@@ -960,12 +1177,12 @@ fn modded(
         &vjson,
         &format!("{}/versions/{}/natives", &mc_dir, game_version),
     );
-    let vanilla_library_list = &lib_manager(&vjson);
-    (
+    let vanilla_library_list = lib_manager(&vjson)?;
+    Ok((
         vanilla_version_jvm_args,
         modded_game_args,
-        vanilla_library_list.to_string(),
-    )
+        vanilla_library_list,
+    ))
 }
 fn command_exists(command_name: &str) -> bool {
     if let Ok(paths) = env::var("PATH") {

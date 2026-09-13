@@ -215,6 +215,7 @@
     "update_fail_replace": "Update failed (replace step): %{err}",
     "update_restart_fail": "Updated, but failed to restart: %{err}",
     "checking_updates": "Checking for updates...",
+    "stop_failed": "Failed to stop the game.",
     "neoforge_needs_java": "Java %{major} is required to run the installer. Downloading it first..."
   },
   "auth": {
@@ -226,6 +227,9 @@
   },
   "dl": {
     "neoforge_running": "Running NeoForge installer...",
+    "neoforge_downloading": "Downloading NeoForge installer...",
+    "neoforge_progress": "Downloading NeoForge installer... %{done} / %{total} MiB",
+    "neoforge_progress_unknown": "Downloading NeoForge installer... %{done} MiB",
     "no_fabric": "No Fabric loader for %{mc}"
   },
   "upd": {
