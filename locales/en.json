@@ -11,8 +11,8 @@
     "reload": "Reload list",
     "ram_range": "Enter 0.5 – 32 (GiB).",
     "select_fabric_first": "Select a Fabric loader version first.",
-    "select_neoforge_manual": "Select a NeoForge version or enter it manually.",
-    "downloading_mc_first": "Downloading Minecraft files first..."
+    "downloading_mc_first": "Downloading Minecraft files first...",
+    "select_neoforge_first": "Select a NeoForge version first."
   },
   "settings": {
     "title": "Settings",
@@ -56,7 +56,6 @@
     "loader_label": "Mod loader",
     "fabric_placeholder": "Select a loader version",
     "neoforge_placeholder": "Select a NeoForge version",
-    "manual_placeholder": "Or enter version manually",
     "name_placeholder": "Empty = default version id",
     "install": "Install",
     "show_non_release": "Show non-release versions",
@@ -69,9 +68,8 @@
     "progress_start": "Downloaded 0 from %{total} files. (0%)",
     "neoforge_ok": "NeoForge installed successfully.",
     "neoforge_ok_as": "NeoForge installed as %{name}.",
-    "neoforge_unreachable": "%{err} (NeoForge Maven is unreachable; enter the version manually)",
-    "none_found_for_mc": "No NeoForge found for %{mc}. Enter the version manually.",
-    "loading_neoforge": "Loading NeoForge versions...",
+    "neoforge_unreachable": "%{err} (NeoForge Maven is unreachable)",
+    "none_found_for_mc": "No NeoForge found for %{mc}.",
     "invalid_name": "Invalid name.",
     "name_taken": "A version with this name already exists.",
     "same_name": "Same name, nothing to do."
@@ -138,15 +136,13 @@
     "loader_fabric_ph": "Select a loader version",
     "loader_neoforge": "NeoForge version",
     "loader_neoforge_ph": "Select a NeoForge version",
-    "manual_ph": "Or enter version manually",
     "apply_loader": "Apply loader",
     "apply_version": "Apply version",
     "vanilla_note": "Vanilla instance — no mod loader to switch.",
     "renamed": "Renamed ✓",
     "downloading_fabric": "Downloading Fabric %{loader}... (progress on Installation screen)",
     "no_loader_vanilla": "No loader to switch on vanilla.",
-    "switched_to": "Switched to %{id}.",
-    "loading_loaders": "Loading loader versions..."
+    "switched_to": "Switched to %{id}."
   },
   "store": {
     "title": "Mod store — %{name}",
@@ -168,7 +164,10 @@
     "optional": "optional",
     "unknown_project": "unknown project",
     "no_compatible": "No compatible versions for %{loader} • %{mc}.",
-    "deps": "Dependencies (%{count}) %{arrow}",
+    "deps": "Dependencies (%{count})",
+    "required_for": "Required for (%{count})",
+    "breaks_warn": "⚠ Without this mod may break: %{names}",
+    "breaks_more": "+%{count} more",
     "updates_available": "%{count} update(s) available",
     "downloading": "Downloading %{file}...",
     "updating": "Updating %{title}...",

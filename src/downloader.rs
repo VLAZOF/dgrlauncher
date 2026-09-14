@@ -279,10 +279,10 @@ pub async fn get_neoforge_versions() -> Result<Vec<(String, String)>, String> {
             Ok(ok) => ok,
             Err(e) => return Err(format!("Failed to read NeoForge version list: {e}")),
         },
-        Err(e) => return Err(format!("Failed to fetch NeoForge version list: {e}. You can enter the version manually.")),
+        Err(e) => return Err(format!("Failed to fetch NeoForge version list: {e}")),
     };
     let mut versions = Vec::new();
-    // Minimal manual parse: maven-metadata is a flat list of <version>X</version>.
+    // Minimal parse: maven-metadata is a flat list of <version>X</version>.
     let mut rest = text.as_str();
     while let Some(start) = rest.find("<version>") {
         rest = &rest[start + "<version>".len()..];
@@ -294,7 +294,7 @@ pub async fn get_neoforge_versions() -> Result<Vec<(String, String)>, String> {
         }
     }
     if versions.is_empty() {
-        return Err("NeoForge version list is empty. You can enter the version manually.".to_string());
+        return Err("NeoForge version list is empty.".to_string());
     }
     let mut pairs = Vec::new();
     for v in versions.iter().rev() {

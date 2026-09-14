@@ -41,18 +41,28 @@ pub struct ModDetail {
     pub description: String,
     pub icon_url: String,
     pub downloads: u64,
+    pub source_url: String,
 }
 
 /// One published file of a mod.
 #[derive(Debug, Clone, Default)]
 pub struct ModVersion {
     pub id: String,
+    pub project_id: String,
     pub version_number: String,
     pub loaders: Vec<String>,
     pub game_versions: Vec<String>,
     pub file_url: String,
     pub filename: String,
     pub dependencies: Vec<ModDependency>,
+}
+
+/// One reverse-dependency entry: installed mod `requirer_id` declares
+/// the key project as its `dependency_type` (`required`/`optional`).
+#[derive(Debug, Clone, Default)]
+pub struct Dependent {
+    pub requirer_id: String,
+    pub dependency_type: String,
 }
 
 /// One dependency of a version. `project_id` is `None` when Modrinth
@@ -167,6 +177,7 @@ pub async fn get_project(id: &str) -> Result<ModDetail, String> {
         description: v["description"].as_str().unwrap_or("").to_owned(),
         icon_url: v["icon_url"].as_str().unwrap_or("").to_owned(),
         downloads: v["downloads"].as_u64().unwrap_or(0),
+        source_url: v["source_url"].as_str().unwrap_or("").to_owned(),
     })
 }
 
@@ -186,63 +197,137 @@ pub async fn get_versions(project_id: &str) -> Result<Vec<ModVersion>, String> {
     let mut out = Vec::new();
     if let Some(arr) = v.as_array() {
         for e in arr {
-            let loaders = e["loaders"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let game_versions = e["game_versions"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
-            // Prefer the primary file, fall back to the first one.
-            let mut file_url = String::new();
-            let mut filename = String::new();
-            if let Some(files) = e["files"].as_array() {
-                let f = files
-                    .iter()
-                    .find(|f| f["primary"].as_bool().unwrap_or(false))
-                    .or_else(|| files.first());
-                if let Some(f) = f {
-                    file_url = f["url"].as_str().unwrap_or("").to_owned();
-                    filename = f["filename"].as_str().unwrap_or("").to_owned();
-                }
+            if let Some(ver) = parse_version(e) {
+                out.push(ver);
             }
-            if file_url.is_empty() {
-                continue;
-            }
-            let mut dependencies = Vec::new();
-            if let Some(deps) = e["dependencies"].as_array() {
-                for d in deps {
-                    let t = d["dependency_type"].as_str().unwrap_or("");
-                    if t != "required" && t != "optional" {
-                        continue;
-                    }
-                    dependencies.push(ModDependency {
-                        project_id: d["project_id"].as_str().map(str::to_owned),
-                        dependency_type: t.to_owned(),
-                    });
-                }
-            }
-            out.push(ModVersion {
-                id: e["id"].as_str().unwrap_or("").to_owned(),
-                version_number: e["version_number"].as_str().unwrap_or("?").to_owned(),
-                loaders,
-                game_versions,
-                file_url,
-                filename,
-                dependencies,
-            });
         }
     }
     Ok(out)
+}
+
+/// Single version object shared by `get_versions` and the batch below.
+/// `None` when the entry has no downloadable file (skipped, as before).
+fn parse_version(e: &Value) -> Option<ModVersion> {
+    let loaders = e["loaders"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let game_versions = e["game_versions"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Prefer the primary file, fall back to the first one.
+    let mut file_url = String::new();
+    let mut filename = String::new();
+    if let Some(files) = e["files"].as_array() {
+        let f = files
+            .iter()
+            .find(|f| f["primary"].as_bool().unwrap_or(false))
+            .or_else(|| files.first());
+        if let Some(f) = f {
+            file_url = f["url"].as_str().unwrap_or("").to_owned();
+            filename = f["filename"].as_str().unwrap_or("").to_owned();
+        }
+    }
+    if file_url.is_empty() {
+        return None;
+    }
+    let mut dependencies = Vec::new();
+    if let Some(deps) = e["dependencies"].as_array() {
+        for d in deps {
+            let t = d["dependency_type"].as_str().unwrap_or("");
+            if t != "required" && t != "optional" {
+                continue;
+            }
+            dependencies.push(ModDependency {
+                project_id: d["project_id"].as_str().map(str::to_owned),
+                dependency_type: t.to_owned(),
+            });
+        }
+    }
+    Some(ModVersion {
+        id: e["id"].as_str().unwrap_or("").to_owned(),
+        project_id: e["project_id"].as_str().unwrap_or("").to_owned(),
+        version_number: e["version_number"].as_str().unwrap_or("?").to_owned(),
+        loaders,
+        game_versions,
+        file_url,
+        filename,
+        dependencies,
+    })
+}
+
+/// Batch fetch of concrete versions by their ids (`GET /v2/versions`).
+/// One request for all installed mods of an instance; the caller builds
+/// the reverse-dependency map from the result. Never fails: any error
+/// (or an empty input) simply yields no versions, the UI shows no
+/// dependents section instead of a scary error.
+pub async fn get_versions_by_ids(ids: &[String]) -> Vec<ModVersion> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let joined = ids
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let url = format!("{API}/versions?ids={}", encode(&format!("[{joined}]")));
+    let text = match HTTP.get(url).send().await {
+        Ok(r) => match r.text().await {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&text) {
+        for e in &arr {
+            if let Some(ver) = parse_version(e) {
+                out.push(ver);
+            }
+        }
+    }
+    out
+}
+
+/// Reverse map: `dependency_project_id -> installed mods requiring it`.
+/// Built locally from one batch response; self-references are skipped.
+pub fn build_dependents(versions: &[ModVersion]) -> HashMap<String, Vec<Dependent>> {
+    let mut map: HashMap<String, Vec<Dependent>> = HashMap::new();
+    for v in versions {
+        if v.project_id.is_empty() {
+            continue;
+        }
+        for dep in &v.dependencies {
+            if let Some(pid) = &dep.project_id {
+                if pid.is_empty() || pid == &v.project_id {
+                    continue;
+                }
+                let list = map.entry(pid.clone()).or_default();
+                if !list.iter().any(|d| d.requirer_id == v.project_id) {
+                    list.push(Dependent {
+                        requirer_id: v.project_id.clone(),
+                        dependency_type: dep.dependency_type.clone(),
+                    });
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Canonical Modrinth page URL (slug preferred, id fallback).
+pub fn page_url(detail: &ModDetail) -> String {
+    let slug = if detail.slug.is_empty() { &detail.id } else { &detail.slug };
+    format!("https://modrinth.com/mod/{slug}")
 }
 
 /// Batch project titles for dependency rows: `id -> (slug, title)`.

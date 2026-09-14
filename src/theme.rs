@@ -41,11 +41,6 @@ pub fn green_text(_theme: &Theme) -> text::Style {
         color: Some(color!(166, 218, 149)),
     }
 }
-pub fn red_text(_theme: &Theme) -> text::Style {
-    text::Style {
-        color: Some(color!(150, 0, 0)),
-    }
-}
 impl text::Catalog for Theme {
     type Class<'a> = text::StyleFn<'a, Self>;
     fn default<'a>() -> Self::Class<'a> {
@@ -371,11 +366,7 @@ pub fn pick_list_default(_theme: &Theme, status: pick_list::Status) -> pick_list
     let active = pick_list::Style {
         text_color: Color::from_rgb8(205, 214, 244),
         background: Background::Color(Color::from_rgb8(49, 50, 68)),
-        placeholder_color: Color::from_rgb(
-            0x20 as f32 / 255.0,
-            0x22 as f32 / 255.0,
-            0x25 as f32 / 255.0,
-        ),
+        placeholder_color: Color::from_rgb8(148, 163, 184),
         handle_color: Color::from_rgb8(205, 214, 244),
         border: Border {
             radius: 15.0.into(),

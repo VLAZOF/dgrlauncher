@@ -593,6 +593,11 @@ pub fn get_screen_content<'a>(
                 } else {
                     row![].into()
                 };
+            let update_status: Element<'_, Message> = if app.update_text.is_empty() {
+                row![].into()
+            } else {
+                text(&app.update_text).size(12).into()
+            };
             let update_bar: Element<'_, Message> = if app.update_total > 0 {
                 dl_bar(app.update_downloaded as u64, app.update_total as u64, 10.)
             } else {
@@ -664,7 +669,9 @@ pub fn get_screen_content<'a>(
                             tooltip(
                                 button(svg(svg::Handle::from_memory(
                                     include_bytes!("icons/refresh.svg").as_slice(),
-                                )))
+                                ))
+                                .width(20)
+                                .height(20))
                                 .on_press(Message::RecheckUpdates)
                                 .style(theme::transparent_button)
                                 .width(28)
@@ -677,7 +684,9 @@ pub fn get_screen_content<'a>(
                             tooltip(
                                 button(svg(svg::Handle::from_memory(
                                     include_bytes!("icons/github.svg").as_slice(),
-                                )))
+                                ))
+                                .width(20)
+                                .height(20))
                                 .on_press(Message::OpenURL(
                                     "https://github.com/VLAZOF/dgrlauncher".to_string()
                                 ))
@@ -700,7 +709,7 @@ pub fn get_screen_content<'a>(
                         ]
                         .spacing(10)
                         .align_y(Alignment::Center),
-                        text(&app.update_text).size(12),
+                        update_status,
                         update_bar,
                         notes,
                     ]
@@ -770,25 +779,11 @@ pub fn get_screen_content<'a>(
                         .placeholder(t!("instance.loader_neoforge_ph"))
                     .width(250)
                     .text_size(15);
-                    loader_column = loader_column
-                        .push(neoforge_pick_list)
-                        .push(
-                            row![
-                                text_input(
-                                    crate::tr!("install.manual_placeholder"),
-                                    &app.neoforge_manual
-                                )
-                                .on_input(Message::NeoForgeManualChanged)
-                                .size(14)
-                                .width(200),
-                                button(text(t!("common.reload")).size(12))
-                                    .on_press(Message::ReloadNeoForgeList)
-                                    .padding(5),
-                            ]
-                            .spacing(10)
-                            .align_y(Alignment::Center),
-                        )
-                        .push(text(&app.neoforge_status).size(12));
+                    loader_column = loader_column.push(neoforge_pick_list);
+                    if !app.neoforge_status.is_empty() {
+                        loader_column =
+                            loader_column.push(text(&app.neoforge_status).size(12));
+                    }
                 }
             }
             let install_button = button(
@@ -1070,8 +1065,6 @@ pub fn get_screen_content<'a>(
                                 .padding(6),
                         ]
                         .spacing(10),
-                        text(&app.il_status).size(12),
-                        text(&app.download_text).size(12),
                     ]
                     .spacing(8)
                 } else if crate::version_kind(&app.current_version)
@@ -1087,25 +1080,15 @@ pub fn get_screen_content<'a>(
                         .placeholder(t!("instance.loader_neoforge_ph"))
                         .width(250)
                         .text_size(14),
-                        row![
-                            text_input(crate::tr!("instance.manual_ph"), &app.il_manual)
-                                .on_input(Message::InstanceLoaderManualChanged)
-                                .size(13)
-                                .width(200),
+                        row![button(text(t!("instance.apply_version")).size(13))
+                            .on_press(Message::InstanceLoaderApply)
+                            .style(theme::secondary_button)
+                            .padding(6),
                             button(text(t!("common.reload")).size(12))
                                 .on_press(Message::InstanceLoaderReload)
                                 .padding(6),
                         ]
-                        .spacing(10)
-                        .align_y(Alignment::Center),
-                        row![button(text(t!("instance.apply_version")).size(13))
-                            .on_press(Message::InstanceLoaderApply)
-                            .style(theme::secondary_button)
-                            .padding(6),]
                         .spacing(10),
-                        text(&app.il_status).size(12),
-                        text(&app.neoforge_status).size(12),
-                        text(&app.download_text).size(12),
                     ]
                     .spacing(8)
                 } else {
@@ -1116,6 +1099,18 @@ pub fn get_screen_content<'a>(
                     ]
                     .spacing(8)
                 };
+            let mut loader_block = loader_block;
+            // Status lines appear only on error/progress, so both
+            // loaders keep the same height while lists load.
+            if !app.il_status.is_empty() {
+                loader_block = loader_block.push(text(&app.il_status).size(12));
+            }
+            if !app.neoforge_status.is_empty() {
+                loader_block = loader_block.push(text(&app.neoforge_status).size(12));
+            }
+            if !app.download_text.is_empty() {
+                loader_block = loader_block.push(text(&app.download_text).size(12));
+            }
             let content = column![
                 row![
                     icon_picker(
@@ -1350,9 +1345,9 @@ pub fn get_screen_content<'a>(
                                     .padding(8),
                                 );
                             }
+                            let armed = app.modstore_delete_confirm.as_deref()
+                                == Some(&e.project_id);
                             {
-                                let armed = app.modstore_delete_confirm.as_deref()
-                                    == Some(&e.project_id);
                                 let delete_button = delete_button(
                                     armed,
                                     Message::ModDeletePressed(e.project_id.clone()),
@@ -1363,6 +1358,23 @@ pub fn get_screen_content<'a>(
                                     installed_row.push(delete_button);
                             }
                             list = list.push(installed_row);
+                            // Armed delete of a required dependency warns
+                            // which installed mods may break with it.
+                            if armed
+                                && let Some(warn) =
+                                    dependents_warning(app, &e.project_id)
+                            {
+                                list = list.push(
+                                    container(
+                                        text(warn)
+                                            .size(12)
+                                            .style(theme::peach_text),
+                                    )
+                                    .style(theme::black_container)
+                                    .padding(8)
+                                    .width(Length::Fill),
+                                );
+                            }
                             // Inline update confirm: current -> new version.
                             if app.modstore_update_confirm.as_deref()
                                 == Some(&e.project_id)
@@ -1476,18 +1488,48 @@ pub fn get_screen_content<'a>(
             main.height(Length::Fill)
         }
         Screen::ModPage => {
-            let back = row![
-                back_button(Message::ModPageBack),
-                text(
-                    app.modstore_detail
-                        .as_ref()
-                        .map(|d| d.title.clone())
-                        .unwrap_or_else(|| t!("store.page_fallback").to_string())
-                )
-                .size(20),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center);
+            let back = match &app.modstore_detail {
+                Some(d) => {
+                    let mut title_row = row![
+                        back_button(Message::ModPageBack),
+                        text(d.title.clone()).size(20),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center);
+                    let modrinth_url = crate::modrinth::page_url(d);
+                    title_row = title_row.push(
+                        button(
+                            svg(svg::Handle::from_memory(
+                                include_bytes!("icons/link.svg").as_slice(),
+                            ))
+                            .width(16)
+                            .height(16),
+                        )
+                        .on_press(Message::OpenURL(modrinth_url))
+                        .padding(6),
+                    );
+                    if !d.source_url.is_empty() {
+                        title_row = title_row.push(
+                            button(
+                                svg(svg::Handle::from_memory(
+                                    include_bytes!("icons/github.svg").as_slice(),
+                                ))
+                                .width(16)
+                                .height(16),
+                            )
+                            .on_press(Message::OpenURL(d.source_url.clone()))
+                            .padding(6),
+                        );
+                    }
+                    title_row
+                }
+                None => row![
+                    back_button(Message::ModPageBack),
+                    text(t!("store.page_fallback")).size(20),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            };
             let content: Column<'a, Message, super::theme::Theme, Renderer> =
                 match &app.modstore_detail {
                     None => column![
@@ -1516,93 +1558,151 @@ pub fn get_screen_content<'a>(
                         .spacing(12)
                         .align_y(Alignment::Center);
                         let mut top = column![info].spacing(10);
-                        // Dependencies of the newest compatible version:
-                        // expandable, required vs optional marked.
-                        // A click opens that mod's page (Back returns here).
+                        // Dependencies of the newest compatible version as a
+                        // pick_list (selecting opens that mod page).
+                        // Installed ones are prefixed with ✓.
                         if let Some(latest) = crate::modrinth::latest_compatible(
                             &app.modstore_versions,
                             &loader,
                             &mc,
                         ) {
                             if !latest.dependencies.is_empty() {
-                                top = top.push(
-                                    button(
-                                        text(t!(
-                                            "store.deps",
-                                            count = latest.dependencies.len(),
-                                            arrow = if app.modstore_deps_expanded {
-                                                "▾"
-                                            } else {
-                                                "▸"
-                                            }
-                                        ))
-                                        .size(13),
-                                    )
-                                    .on_press(Message::ModDepsToggled)
-                                    .padding(6),
-                                );
-                                if app.modstore_deps_expanded {
-                                    let mut deps_col = column![].spacing(4);
-                                    for dep in &latest.dependencies {
-                                        let badge = if dep.dependency_type
-                                            == "required"
-                                        {
-                                            text(t!("store.required"))
-                                                .size(11)
-                                                .style(theme::red_text)
+                                let mut options: Vec<String> = Vec::new();
+                                for dep in &latest.dependencies {
+                                    if let Some(pid) = &dep.project_id {
+                                        let title = app
+                                            .modstore_dep_titles
+                                            .get(pid)
+                                            .map(|(_, title)| title.clone())
+                                            .unwrap_or_else(|| short_desc(pid, 24));
+                                        let kind = if dep.dependency_type == "required" {
+                                            t!("store.required")
                                         } else {
-                                            text(t!("store.optional"))
-                                                .size(11)
-                                                .style(theme::peach_text)
+                                            t!("store.optional")
                                         };
-                                        match &dep.project_id {
-                                            Some(pid) => {
-                                                let (slug, title) =
-                                                    app.modstore_dep_titles
-                                                        .get(pid)
-                                                        .cloned()
-                                                        .unwrap_or((
-                                                            String::new(),
-                                                            short_desc(pid, 24),
-                                                        ));
-                                                let page_id = if slug.is_empty() {
-                                                    pid.clone()
-                                                } else {
-                                                    slug
-                                                };
-                                                deps_col = deps_col.push(
-                                                    button(
-                                                        row![
-                                                            badge,
-                                                            text(title).size(13),
-                                                        ]
-                                                        .spacing(8)
-                                                        .align_y(Alignment::Center),
-                                                    )
-                                                    .on_press(Message::OpenModPage(
-                                                        page_id,
-                                                    ))
-                                                    .style(
-                                                        theme::instance_row_button(false),
-                                                    )
-                                                    .padding(6)
-                                                    .width(Length::Fill),
-                                                );
-                                            }
-                                            None => {
-                                                deps_col = deps_col.push(
-                                                    row![
-                                                        badge,
-                                                        text(t!("store.unknown_project")).size(13),
-                                                    ]
-                                                    .spacing(8),
-                                                );
-                                            }
+                                        if app.modstore_installed.contains_key(pid) {
+                                            options.push(format!("✓ {kind} · {title}"));
+                                        } else {
+                                            options.push(format!("{kind} · {title}"));
                                         }
                                     }
-                                    top = top.push(deps_col);
+                                }
+                                if !options.is_empty() {
+                                    let selected = if app.modstore_dep_selected.is_empty() {
+                                        None
+                                    } else {
+                                        Some(app.modstore_dep_selected.clone())
+                                    };
+                                    top = top.push(
+                                        pick_list(
+                                            options,
+                                            selected,
+                                            Message::ModDepSelected,
+                                        )
+                                        .placeholder(t!("store.deps", count = latest.dependencies.len()))
+                                        .width(250)
+                                        .text_size(13),
+                                    );
                                 }
                             }
+                        }
+                        // Installed mods requiring this one ("Required for"):
+                        // compact rows opening each requirer's page through
+                        // the existing Back history. Titles/icons come from
+                        // the sidecar, no extra requests.
+                        if let Some(raw) = app.modstore_dependents.get(&d.id) {
+                            let mut reqs: Vec<(
+                                &crate::modrinth::InstalledMod,
+                                &str,
+                            )> = raw
+                                .iter()
+                                .filter_map(|dep| {
+                                    let e = app
+                                        .modstore_installed
+                                        .get(&dep.requirer_id)?;
+                                    Some((e, dep.dependency_type.as_str()))
+                                })
+                                .collect();
+                            reqs.sort_by(|a, b| a.0.title.cmp(&b.0.title));
+                            if !reqs.is_empty() {
+                                top = top.push(
+                                    text(t!(
+                                        "store.required_for",
+                                        count = reqs.len()
+                                    ))
+                                    .size(14),
+                                );
+                                let mut rows = column![].spacing(6);
+                                let n = reqs.len();
+                                for (req, kind) in reqs {
+                                    let page_id = if req.slug.is_empty() {
+                                        req.project_id.clone()
+                                    } else {
+                                        req.slug.clone()
+                                    };
+                                    let kind_label = if kind == "required" {
+                                        t!("store.required").to_string()
+                                    } else {
+                                        t!("store.optional").to_string()
+                                    };
+                                    let item = row![
+                                        mod_icon(
+                                            &app.modstore_icons,
+                                            &req.icon_url,
+                                            28.,
+                                        ),
+                                        column![
+                                            text(req.title.clone()).size(14),
+                                            text(kind_label)
+                                                .size(11)
+                                                .style(theme::peach_text),
+                                        ]
+                                        .spacing(2)
+                                        .width(Length::Fill),
+                                    ]
+                                    .spacing(10)
+                                    .align_y(Alignment::Center);
+                                    rows = rows.push(
+                                        button(item)
+                                            .on_press(Message::OpenModPage(
+                                                page_id,
+                                            ))
+                                            .style(
+                                                theme::instance_row_button(false)
+                                            )
+                                            .padding(6)
+                                            .width(Length::Fill),
+                                    );
+                                }
+                                // Cap the block: a library with 20 requirers
+                                // must not push the version list off-screen —
+                                // the overflow scrolls inside (~3 rows).
+                                let capped = (n as f32 * 60.).min(180.);
+                                top = top.push(container(
+                                    scrollable(rows)
+                                        .width(Length::Fill)
+                                        .height(Length::Fixed(capped)),
+                                )
+                                .style(theme::black_container)
+                                .padding(8)
+                                .width(Length::Fill));
+                            }
+                        }
+                        // Armed delete of a required dependency warns here
+                        // too (the page delete button lives below).
+                        if app.modstore_delete_confirm.as_deref() == Some(&d.id)
+                            && let Some(warn) = dependents_warning(app, &d.id)
+                        {
+                            top = top.push(
+                                container(
+                                    text(warn)
+                                        .size(12)
+                                        .style(theme::peach_text),
+                                )
+                                .style(theme::black_container)
+                                .padding(8)
+                                .width(Length::Fill),
+                            );
                         }
                         // Compatible versions only. The action buttons live
                         // on the row under the cursor: Download, or ✓ and
@@ -1734,4 +1834,45 @@ fn short_mc(versions: &[String]) -> String {
         s.push('?');
     }
     s
+}
+
+/// Installed mods requiring `project_id`, sorted by title.
+/// Requirers dropped from the sidecar meanwhile are skipped.
+fn dependents_sorted<'a>(
+    app: &'a super::DgrLauncher,
+    project_id: &str,
+) -> Vec<&'a crate::modrinth::InstalledMod> {
+    let mut out: Vec<&crate::modrinth::InstalledMod> = match app
+        .modstore_dependents
+        .get(project_id)
+    {
+        Some(list) => list
+            .iter()
+            .filter_map(|d| app.modstore_installed.get(&d.requirer_id))
+            .collect(),
+        None => Vec::new(),
+    };
+    out.sort_by(|a, b| a.title.cmp(&b.title));
+    out
+}
+
+/// Delete-confirm warning: which installed mods may break without this
+/// one. Up to 3 titles, then "+N more". `None` when nothing depends on it.
+fn dependents_warning(app: &super::DgrLauncher, project_id: &str) -> Option<String> {
+    let deps = dependents_sorted(app, project_id);
+    if deps.is_empty() {
+        return None;
+    }
+    let mut names = deps
+        .iter()
+        .take(3)
+        .map(|e| e.title.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let extra = deps.len().saturating_sub(3);
+    if extra > 0 {
+        names.push(' ');
+        names.push_str(&t!("store.breaks_more", count = extra).to_string());
+    }
+    Some(t!("store.breaks_warn", names = names).to_string())
 }

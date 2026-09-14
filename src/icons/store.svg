@@ -1,2 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="512" height="512"><path d="M2 3h4v2H4v2h13l-2 9H7L4.6 5H2V3zm4 4l1.2 5h8.3l1.2-5H6z"/><circle cx="10" cy="19" r="1.8"/><circle cx="16" cy="19" r="1.8"/></svg>
+<?xml version="1.0" encoding="utf-8"?>
+<svg width="24" height="24" viewBox="-0.5 0 12 12" xmlns="http://www.w3.org/2000/svg">
+  <path id="Path_3" data-name="Path 3" d="M130.7,837h-6.454a2.283,2.283,0,0,1-2.273-2.292V825h11v9.708A2.284,2.284,0,0,1,130.7,837Zm1.269-10.99h-9.025v8.6a1.369,1.369,0,0,0,1.363,1.375h6.3a1.369,1.369,0,0,0,1.363-1.375Zm-4.528,3.948v.032a2.506,2.506,0,0,1-2.492-2.323V827h1v.667a1.482,1.482,0,0,0,1.489,1.375,1.511,1.511,0,0,0,1.52-1.375V827h.971v.667A2.477,2.477,0,0,1,127.442,829.958Z" transform="translate(-121.974 -825)" fill="#fff"/>
+</svg>

@@ -61,7 +61,7 @@ fn main() -> iced::Result {
     let mut window_settings = window::Settings {
         size: iced::Size {
             width: 900.,
-            height: 535.,
+            height: 800.,
         },
         min_size: Some(iced::Size {
             width: 700.,
@@ -120,7 +120,6 @@ struct DgrLauncher {
     neoforge_all: Vec<(String, String)>,
     neoforge_versions_for_mc: Vec<String>,
     neoforge_selected: String,
-    neoforge_manual: String,
     neoforge_status: String,
     pending_neoforge_install: Option<(String, String)>,
     download_text: String,
@@ -177,8 +176,8 @@ struct DgrLauncher {
     modstore_check_manual: bool,
     /// Mod page history for Back (dependency hopping).
     modstore_history: Vec<String>,
-    /// Dependency section state on the mod page.
-    modstore_deps_expanded: bool,
+    /// Selected dependency on the mod page (pick_list display string).
+    modstore_dep_selected: String,
     modstore_dep_titles: HashMap<String, (String, String)>,
     /// Which project the loaded `modstore_versions` belong to. The list
     /// survives navigation, so the update-entry refresh must never use a
@@ -186,6 +185,9 @@ struct DgrLauncher {
     modstore_versions_project: Option<String>,
     /// Installed mods of the current instance (`project_id -> entry`).
     modstore_installed: HashMap<String, modrinth::InstalledMod>,
+    /// Reverse deps: `dependency_project_id -> installed requirers`.
+    /// One batch request per instance, refreshed on install/delete/link.
+    modstore_dependents: HashMap<String, Vec<modrinth::Dependent>>,
     /// Armed mod delete confirmation (`project_id`), same two-click pattern
     /// as instance delete.
     modstore_delete_confirm: Option<String>,
@@ -199,11 +201,10 @@ struct DgrLauncher {
     instance_env_text: String,
     instance_settings_status: String,
     /// Loader switch state (fabric loaders or NeoForge versions for the base
-    /// MC, selected/manual input, status). `pending_loader_switch` moves the
+    /// MC, selected version, status). `pending_loader_switch` moves the
     /// selection to the new NeoForge instance id when it finishes.
     il_loader_list: Vec<String>,
     il_selected: String,
-    il_manual: String,
     il_status: String,
     pending_loader_switch: Option<String>,
     /// Optional custom instance name typed on the Installation screen.
@@ -476,9 +477,7 @@ enum Message {
     FabricLoaderChanged(String),
     GotFabricLoaders(Result<Vec<String>, String>),
     GotNeoForgeList(Result<Vec<(String, String)>, String>),
-    ReloadNeoForgeList,
     NeoForgeVersionChanged(String),
-    NeoForgeManualChanged(String),
     InstallPressed,
     ManageDownload((usize, downloader::Progress)),
     VanillaJson(Value),
@@ -531,8 +530,9 @@ enum Message {
     ModUpdatePressed(String),
     ModUpdateApply(String),
     ModPageBack,
-    ModDepsToggled,
+    ModDepSelected(String),
     GotModDepTitles(HashMap<String, (String, String)>),
+    GotModDependents(String, HashMap<String, Vec<modrinth::Dependent>>),
     ModLinkFinished(Result<usize, String>),
     ModLocalFileDelete(String),
     OpenInstanceSettings,
@@ -549,7 +549,6 @@ enum Message {
     SettingsRamText(String),
     ClearNotices(u32),
     InstanceLoaderChanged(String),
-    InstanceLoaderManualChanged(String),
     InstanceLoaderReload,
     InstanceLoaderApply,
     Exit,
@@ -560,11 +559,7 @@ impl DgrLauncher {
         if self.install_mc_version.is_empty() {
             return None;
         }
-        let nf = if !self.neoforge_manual.trim().is_empty() {
-            self.neoforge_manual.trim().to_owned()
-        } else {
-            self.neoforge_selected.clone()
-        };
+        let nf = self.neoforge_selected.clone();
         if nf.is_empty() {
             return None;
         }
@@ -856,6 +851,31 @@ impl DgrLauncher {
             ));
         }
         tasks
+    }
+    /// One batch request for all installed version ids, resolved into
+    /// the reverse-dependency map. Silent on error (empty map = no
+    /// section, no warnings). The instance id guards against a stale
+    /// response overwriting another instance's map.
+    fn spawn_dependents_check(
+        instance: String,
+        installed: &HashMap<String, modrinth::InstalledMod>,
+    ) -> Task<Message> {
+        let ids: Vec<String> = installed
+            .values()
+            .map(|e| e.version_id.clone())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return Task::none();
+        }
+        Task::perform(
+            async move {
+                let versions = modrinth::get_versions_by_ids(&ids).await;
+                let map = modrinth::build_dependents(&versions);
+                (instance, map)
+            },
+            |(instance, map)| Message::GotModDependents(instance, map),
+        )
     }
     /// Auto-clear terminal status notices after 5s. Callers bump
     /// `notice_seq` first and batch this with their return task; a stale
@@ -1151,20 +1171,27 @@ impl DgrLauncher {
                 state.modstore_pending_checks = 0;
                 state.modstore_check_manual = false;
                 state.modstore_history = Vec::new();
-                state.modstore_deps_expanded = false;
+                state.modstore_dep_selected = String::new();
                 state.modstore_unlinked = Vec::new();
                 state.modstore_linking = false;
                 state.modstore_scroll = 0.0;
                 state.modstore_installed =
                     modrinth::installed_mods(&state.current_version);
+                state.modstore_dependents = HashMap::new();
                 state.modstore_status = t!("store.loading_popular").to_string();
                 // Auto update check for installed mods (manual button too).
                 let (mc, loader) = modrinth::instance_loader(&state.current_version)
                     .unwrap_or_default();
-                let mut tasks = vec![Task::perform(
-                    modrinth::search_mods(""),
-                    Message::GotModSearch,
-                )];
+                let mut tasks = vec![
+                    Task::perform(
+                        modrinth::search_mods(""),
+                        Message::GotModSearch,
+                    ),
+                    spawn_dependents_check(
+                        state.current_version.clone(),
+                        &state.modstore_installed,
+                    ),
+                ];
                 let checks =
                     spawn_update_checks(&state.modstore_installed, loader, mc);
                 state.modstore_pending_checks = checks.len() as u32;
@@ -1271,7 +1298,7 @@ impl DgrLauncher {
                 state.modstore_downloading = false;
                 state.modstore_delete_confirm = None;
                 state.modstore_hovered_version = None;
-                state.modstore_deps_expanded = false;
+                state.modstore_dep_selected = String::new();
                 state.modstore_status = t!("store.loading_page").to_string();
                 return fetch_mod_page(id);
             }
@@ -1353,7 +1380,10 @@ impl DgrLauncher {
                         modrinth::installed_mods(&state.current_version);
                     state.modstore_unlinked =
                         modrinth::unlinked_mod_files(&state.current_version);
-                    let mut tasks = Vec::new();
+                    let mut tasks = vec![spawn_dependents_check(
+                        state.current_version.clone(),
+                        &state.modstore_installed,
+                    )];
                     // Identify hand-dropped jars by hash (auto-link).
                     if !state.modstore_unlinked.is_empty() && !state.modstore_linking
                     {
@@ -1387,8 +1417,10 @@ impl DgrLauncher {
             Message::ModLinkFinished(result) => {
                 state.modstore_linking = false;
                 let mut armed = false;
+                let mut linked = 0;
                 match result {
                     Ok(n) => {
+                        linked = n;
                         state.modstore_installed =
                             modrinth::installed_mods(&state.current_version);
                         state.modstore_unlinked =
@@ -1408,6 +1440,20 @@ impl DgrLauncher {
                         state.modstore_status = err;
                         armed = true;
                     }
+                }
+                if linked > 0 {
+                    let deps = spawn_dependents_check(
+                        state.current_version.clone(),
+                        &state.modstore_installed,
+                    );
+                    if armed {
+                        state.notice_seq = state.notice_seq.wrapping_add(1);
+                        return Task::batch(vec![
+                            clear_notices_later(state.notice_seq),
+                            deps,
+                        ]);
+                    }
+                    return deps;
                 }
                 if armed {
                     state.notice_seq = state.notice_seq.wrapping_add(1);
@@ -1524,7 +1570,11 @@ impl DgrLauncher {
                     }
                 }
                 refresh_mods_count(state);
-                return notice;
+                let deps = spawn_dependents_check(
+                    state.current_version.clone(),
+                    &state.modstore_installed,
+                );
+                return Task::batch(vec![notice, deps]);
             }
             Message::ModDeletePressed(project_id) => {
                 if state.modstore_delete_confirm.as_deref() == Some(&project_id) {
@@ -1541,11 +1591,25 @@ impl DgrLauncher {
                     if state.modstore_update_confirm.as_deref() == Some(&project_id) {
                         state.modstore_update_confirm = None;
                     }
+                    // Prune the reverse map at once (the async refresh
+                    // below only confirms it): the deleted mod is neither
+                    // a dependency nor a requirer anymore.
+                    state.modstore_dependents.remove(&project_id);
+                    state.modstore_dependents.retain(|_, list| {
+                        list.retain(|d| d.requirer_id != project_id);
+                        !list.is_empty()
+                    });
                     state.modstore_installed =
                         modrinth::installed_mods(&state.current_version);
                     refresh_mods_count(state);
                     state.notice_seq = state.notice_seq.wrapping_add(1);
-                    return clear_notices_later(state.notice_seq);
+                    return Task::batch(vec![
+                        clear_notices_later(state.notice_seq),
+                        spawn_dependents_check(
+                            state.current_version.clone(),
+                            &state.modstore_installed,
+                        ),
+                    ]);
                 }
                 // First click: arm confirmation.
                 state.modstore_delete_confirm = Some(project_id);
@@ -1566,7 +1630,11 @@ impl DgrLauncher {
                 let checks =
                     spawn_update_checks(&state.modstore_installed, loader, mc);
                 state.modstore_pending_checks = checks.len() as u32;
-                if checks.is_empty() {
+                let deps = spawn_dependents_check(
+                    state.current_version.clone(),
+                    &state.modstore_installed,
+                );
+                if state.modstore_pending_checks == 0 {
                     state.modstore_check_manual = false;
                     state.modstore_status = if state.modstore_installed.is_empty() {
                         t!("store.none_installed").to_string()
@@ -1574,11 +1642,16 @@ impl DgrLauncher {
                         t!("store.all_uptodate").to_string()
                     };
                     state.notice_seq = state.notice_seq.wrapping_add(1);
-                    return clear_notices_later(state.notice_seq);
+                    return Task::batch(vec![
+                        clear_notices_later(state.notice_seq),
+                        deps,
+                    ]);
                 }
                 state.modstore_check_manual = true;
                 state.modstore_status = t!("store.checking").to_string();
-                return Task::batch(checks);
+                let mut tasks: Vec<Task<Message>> = checks;
+                tasks.push(deps);
+                return Task::batch(tasks);
             }
             Message::ModUpdateChecked(pid, latest) => {
                 match latest {
@@ -1636,6 +1709,7 @@ impl DgrLauncher {
                     description: String::new(),
                     icon_url: entry.icon_url.clone(),
                     downloads: 0,
+                    source_url: String::new(),
                 };
                 let instance = state.current_version.clone();
                 state.modstore_downloading = true;
@@ -1657,7 +1731,7 @@ impl DgrLauncher {
                     state.modstore_downloading = false;
                     state.modstore_delete_confirm = None;
                     state.modstore_hovered_version = None;
-                    state.modstore_deps_expanded = false;
+                    state.modstore_dep_selected = String::new();
                     state.modstore_status = t!("store.loading_page").to_string();
                     return fetch_mod_page(prev);
                 }
@@ -1665,14 +1739,72 @@ impl DgrLauncher {
                 state.modstore_installed =
                     modrinth::installed_mods(&state.current_version);
                 let y = state.modstore_scroll;
-                return restore_store_scroll(y);
+                return Task::batch(vec![
+                    restore_store_scroll(y),
+                    spawn_dependents_check(
+                        state.current_version.clone(),
+                        &state.modstore_installed,
+                    ),
+                ]);
             }
-            Message::ModDepsToggled => {
-                state.modstore_deps_expanded = !state.modstore_deps_expanded;
-                Task::none()
+            Message::ModDepSelected(display) => {
+                state.modstore_dep_selected = display.clone();
+                let (mc, loader) = modrinth::instance_loader(&state.current_version).unwrap_or_default();
+                let page: Option<String> = modrinth::latest_compatible(&state.modstore_versions, &loader, &mc)
+                    .map(|latest| {
+                        latest.dependencies.iter().filter_map(|dep| {
+                            let pid = dep.project_id.clone()?;
+                            let (slug, title) = state.modstore_dep_titles.get(&pid).cloned().unwrap_or((String::new(), pid.clone()));
+                            let kind = if dep.dependency_type == "required" {
+                                t!("store.required").to_string()
+                            } else {
+                                t!("store.optional").to_string()
+                            };
+                            let mut label = format!("{kind} · {title}");
+                            if state.modstore_installed.contains_key(&pid) { label = format!("✓ {label}"); }
+                            let id = if slug.is_empty() { pid } else { slug };
+                            Some((label, id))
+                        }).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|(label, _)| *label == display)
+                    .map(|(_, id)| id);
+                match page {
+                    Some(id) => {
+                        if state.screen == Screen::ModPage {
+                            if let Some(d) = &state.modstore_detail {
+                                let back_to = d.id.clone();
+                                if state.modstore_history.last() != Some(&back_to) {
+                                    state.modstore_history.push(back_to);
+                                    if state.modstore_history.len() > 20 { state.modstore_history.remove(0); }
+                                }
+                            }
+                        }
+                        state.screen = Screen::ModPage;
+                        state.modstore_detail = None;
+                        state.modstore_versions = Vec::new();
+                        state.modstore_versions_project = None;
+                        state.modstore_downloading = false;
+                        state.modstore_delete_confirm = None;
+                        state.modstore_hovered_version = None;
+                        state.modstore_dep_selected = String::new();
+                        state.modstore_status = t!("store.loading_page").to_string();
+                        return fetch_mod_page(id);
+                    }
+                    None => Task::none(),
+                }
             }
             Message::GotModDepTitles(map) => {
                 state.modstore_dep_titles.extend(map);
+                Task::none()
+            }
+            Message::GotModDependents(instance, map) => {
+                // Stale response for another instance: ignore.
+                if instance != state.current_version {
+                    return Task::none();
+                }
+                state.modstore_dependents = map;
                 Task::none()
             }
             Message::OpenInstanceSettings => {
@@ -1687,7 +1819,6 @@ impl DgrLauncher {
                 state.instance_env_text = cfg.env.clone().unwrap_or_default();
                 state.instance_settings_status = String::new();
                 state.il_status = String::new();
-                state.il_manual = String::new();
                 state.il_loader_list = Vec::new();
                 state.il_selected = String::new();
                 // Prefill loader switch data for modded instances.
@@ -1874,15 +2005,9 @@ impl DgrLauncher {
             }
             Message::InstanceLoaderChanged(loader) => {
                 state.il_selected = loader;
-                state.il_manual = String::new();
-                Task::none()
-            }
-            Message::InstanceLoaderManualChanged(version) => {
-                state.il_manual = version;
                 Task::none()
             }
             Message::InstanceLoaderReload => {
-                state.il_status = t!("instance.loading_loaders").to_string();
                 state.il_loader_list = Vec::new();
                 state.il_selected = String::new();
                 if version_kind(&state.current_version) == VersionKind::Fabric {
@@ -1923,13 +2048,9 @@ impl DgrLauncher {
                     return Task::none();
                 }
                 if version_kind(&state.current_version) == VersionKind::NeoForge {
-                    let nf = if !state.il_manual.trim().is_empty() {
-                        state.il_manual.trim().to_owned()
-                    } else {
-                        state.il_selected.clone()
-                    };
+                    let nf = state.il_selected.clone();
                     if nf.is_empty() {
-                        state.il_status = t!("common.select_neoforge_manual").to_string();
+                        state.il_status = t!("common.select_neoforge_first").to_string();
                         state.notice_seq = state.notice_seq.wrapping_add(1);
                         return clear_notices_later(state.notice_seq);
                     }
@@ -2282,8 +2403,6 @@ impl DgrLauncher {
                     }
                     LoaderChoice::NeoForge => {
                         if state.neoforge_all.is_empty() {
-                        state.neoforge_status =
-                            t!("install.loading_neoforge").to_string();
                             return Task::perform(
                                 downloader::get_neoforge_versions(),
                                 Message::GotNeoForgeList,
@@ -2331,20 +2450,8 @@ impl DgrLauncher {
                 }
                 Task::none()
             }
-            Message::ReloadNeoForgeList => {
-                state.neoforge_status = t!("install.loading_neoforge").to_string();
-                Task::perform(
-                    downloader::get_neoforge_versions(),
-                    Message::GotNeoForgeList,
-                )
-            }
             Message::NeoForgeVersionChanged(version) => {
                 state.neoforge_selected = version;
-                state.neoforge_manual = String::new();
-                Task::none()
-            }
-            Message::NeoForgeManualChanged(version) => {
-                state.neoforge_manual = version;
                 Task::none()
             }
             Message::InstallNameChanged(name) => {
@@ -2367,7 +2474,7 @@ impl DgrLauncher {
                 Task::none()
             }
             Message::InstallPressed => {
-                // A manual install cancels a pending loader switch target.
+                // A fresh install cancels a pending loader switch target.
                 state.pending_loader_switch = None;
                 if state.install_mc_version.is_empty() {
                     state.download_text = t!("install.select_mc_first").to_string();
@@ -2438,14 +2545,10 @@ impl DgrLauncher {
                         );
                     }
                     LoaderChoice::NeoForge => {
-                        let nf = if !state.neoforge_manual.trim().is_empty() {
-                            state.neoforge_manual.trim().to_owned()
-                        } else {
-                            state.neoforge_selected.clone()
-                        };
+                        let nf = state.neoforge_selected.clone();
                         if nf.is_empty() {
                             state.neoforge_status =
-                                t!("common.select_neoforge_manual").to_string();
+                                t!("common.select_neoforge_first").to_string();
                             state.notice_seq = state.notice_seq.wrapping_add(1);
                             return clear_notices_later(state.notice_seq);
                         }
@@ -3453,7 +3556,6 @@ fn filter_neoforge_for_mc(state: &mut DgrLauncher) {
         .first()
         .cloned()
         .unwrap_or_default();
-    state.neoforge_manual = String::new();
     if state.neoforge_versions_for_mc.is_empty() && !state.install_mc_version.is_empty() {
         state.neoforge_status = t!(
             "install.none_found_for_mc",

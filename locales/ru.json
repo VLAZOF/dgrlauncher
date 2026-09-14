@@ -11,8 +11,8 @@
     "reload": "Обновить список",
     "ram_range": "Введите 0.5 – 32 (GiB).",
     "select_fabric_first": "Сначала выберите версию Fabric-загрузчика.",
-    "select_neoforge_manual": "Выберите версию NeoForge или введите её вручную.",
-    "downloading_mc_first": "Сначала загружаю файлы Minecraft..."
+    "downloading_mc_first": "Сначала загружаю файлы Minecraft...",
+    "select_neoforge_first": "Сначала выберите версию NeoForge."
   },
   "settings": {
     "title": "Настройки",
@@ -56,7 +56,6 @@
     "loader_label": "Загрузчик модов",
     "fabric_placeholder": "Выберите версию загрузчика",
     "neoforge_placeholder": "Выберите версию NeoForge",
-    "manual_placeholder": "Или введите версию вручную",
     "name_placeholder": "Пусто = стандартный id версии",
     "install": "Установить",
     "show_non_release": "Показать не-релизные версии",
@@ -69,9 +68,8 @@
     "progress_start": "Загружено 0 из %{total} файлов. (0%)",
     "neoforge_ok": "NeoForge успешно установлен.",
     "neoforge_ok_as": "NeoForge установлен как %{name}.",
-    "neoforge_unreachable": "%{err} (NeoForge Maven недоступен; введите версию вручную)",
-    "none_found_for_mc": "NeoForge для %{mc} не найден. Введите версию вручную.",
-    "loading_neoforge": "Загружаю версии NeoForge...",
+    "neoforge_unreachable": "%{err} (NeoForge Maven недоступен)",
+    "none_found_for_mc": "NeoForge для %{mc} не найден.",
     "invalid_name": "Некорректное имя.",
     "name_taken": "Версия с таким именем уже существует.",
     "same_name": "То же имя, нечего делать."
@@ -138,15 +136,13 @@
     "loader_fabric_ph": "Выберите версию загрузчика",
     "loader_neoforge": "Версия NeoForge",
     "loader_neoforge_ph": "Выберите версию NeoForge",
-    "manual_ph": "Или введите версию вручную",
     "apply_loader": "Применить загрузчик",
     "apply_version": "Применить версию",
     "vanilla_note": "Ванильный инстанс — загрузчик менять не на что.",
     "renamed": "Переименовано ✓",
     "downloading_fabric": "Загружаю Fabric %{loader}... (прогресс на экране установки)",
     "no_loader_vanilla": "На ванильном инстансе загрузчик не меняется.",
-    "switched_to": "Переключено на %{id}.",
-    "loading_loaders": "Загружаю версии загрузчика..."
+    "switched_to": "Переключено на %{id}."
   },
   "store": {
     "title": "Магазин модов — %{name}",
@@ -168,7 +164,10 @@
     "optional": "необязательная",
     "unknown_project": "неизвестный проект",
     "no_compatible": "Нет совместимых версий для %{loader} • %{mc}.",
-    "deps": "Зависимости (%{count}) %{arrow}",
+    "deps": "Зависимости (%{count})",
+    "required_for": "Требуется для (%{count})",
+    "breaks_warn": "⚠ Без этого мода могут сломаться: %{names}",
+    "breaks_more": "ещё %{count}",
     "updates_available": "Доступно обновлений: %{count}",
     "downloading": "Загружаю %{file}...",
     "updating": "Обновляю %{title}...",
